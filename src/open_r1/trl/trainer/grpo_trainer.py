@@ -833,99 +833,99 @@ class GRPOTrainer(Trainer):
 
     # Get the per-token log probabilities for the completions for the model and the reference model
     @profiling_decorator
-    # def _get_per_token_logps(self, model, input_ids, attention_mask, logits_to_keep, batch_size=None) -> torch.Tensor:
-    #     batch_size = batch_size or input_ids.size(0)  # Chunk inputs into smaller batches to reduce memory peak
-    #     all_logps = []
-    #     for i in range(0, input_ids.size(0), batch_size):
-    #         input_ids_batch = input_ids[i : i + batch_size]
-    #         attention_mask_batch = attention_mask[i : i + batch_size]
-
-    #         # We add 1 to `logits_to_keep` because the last logits of the sequence is later excluded
-    #         logits = model(
-    #             input_ids=input_ids_batch, attention_mask=attention_mask_batch, logits_to_keep=logits_to_keep + 1
-    #         ).logits
-    #         logits = logits[:, :-1, :]  # (B, L-1, V), exclude the last logit: it corresponds to the next token pred
-    #         input_ids_batch = input_ids_batch[:, -logits_to_keep:]
-    #         # For transformers<=4.48, logits_to_keep argument isn't supported, so here we drop logits ourselves.
-    #         # See https://github.com/huggingface/trl/issues/2770
-    #         logits = logits[:, -logits_to_keep:]
-    #         # Divide logits by sampling temperature.
-    #         # See https://huggingface.co/blog/the_n_implementation_details_of_rlhf_with_ppo#policy-training-implementation-details
-    #         logits = logits / self.temperature
-    #         logps = selective_log_softmax(logits, input_ids_batch)  # compute logprobs for the input tokens
-    #         all_logps.append(logps)
-    #     return torch.cat(all_logps, dim=0)
-    def _get_per_token_logps(
-    self, model, input_ids, attention_mask, logits_to_keep, batch_size=None
-) -> tuple[torch.Tensor, torch.Tensor]:
-    # """
-    # 计算每个 token 的对数概率和熵
-    
-    # 返回:
-    #     logps: 每个 token 的对数概率, shape (B, logits_to_keep)
-    #     entropy: 每个位置的熵 H_t, shape (B, logits_to_keep)
-    # """
-        batch_size = batch_size or input_ids.size(0)
+    def _get_per_token_logps(self, model, input_ids, attention_mask, logits_to_keep, batch_size=None) -> torch.Tensor:
+        batch_size = batch_size or input_ids.size(0)  # Chunk inputs into smaller batches to reduce memory peak
         all_logps = []
-        # all_entropy = []  # 新增：存储熵
-        all_masks = []
         for i in range(0, input_ids.size(0), batch_size):
             input_ids_batch = input_ids[i : i + batch_size]
             attention_mask_batch = attention_mask[i : i + batch_size]
-    
-            # 获取 logits
+
+            # We add 1 to `logits_to_keep` because the last logits of the sequence is later excluded
             logits = model(
-                input_ids=input_ids_batch, 
-                attention_mask=attention_mask_batch, 
-                logits_to_keep=logits_to_keep + 1
+                input_ids=input_ids_batch, attention_mask=attention_mask_batch, logits_to_keep=logits_to_keep + 1
             ).logits
-            
-            logits = logits[:, :-1, :]  # (B, L-1, V)
+            logits = logits[:, :-1, :]  # (B, L-1, V), exclude the last logit: it corresponds to the next token pred
             input_ids_batch = input_ids_batch[:, -logits_to_keep:]
+            # For transformers<=4.48, logits_to_keep argument isn't supported, so here we drop logits ourselves.
+            # See https://github.com/huggingface/trl/issues/2770
             logits = logits[:, -logits_to_keep:]
-            
-            # 应用温度
+            # Divide logits by sampling temperature.
+            # See https://huggingface.co/blog/the_n_implementation_details_of_rlhf_with_ppo#policy-training-implementation-details
             logits = logits / self.temperature
-            
-            # 计算选定 token 的 log prob（原有功能）
-            logps = selective_log_softmax(logits, input_ids_batch)
-            
-            # === 新增：计算每个位置的熵 ===
-            # 1. 计算整个词汇表的概率分布
-            probs = torch.softmax(logits, dim=-1)  # (B, L, V)
-            
-            # 2. 计算 log probs
-            log_probs = torch.log_softmax(logits, dim=-1)  # (B, L, V)
-            
-            # 3. 计算熵: H_t = -sum(p(v) * log(p(v)))
-            
-            entropy = -torch.sum(probs * log_probs, dim=-1)  # (B, L)
-            threshold = 3.948
-            mask = (entropy > threshold).to(dtype=logps.dtype)  # dtype: torch.float32, shape: (B, L)
-            # 注意：这等价于 H = -E[log p]
-            # entropy_per_sample = entropy.mean(dim=1)  # (B,)
-
-            # 步骤2：对所有样本求平均（沿着 B 维度）
-            # entropy_overall = entropy_per_sample.mean(dim=0)  # 标量
-            # entropy_threshold = 5.264
-            # entropy = torch.where(
-            #     entropy >= entropy_threshold, entropy, torch.zeros_like(entropy)
-            # )
-
-            # ✅ 新增: 对非零熵进行缩放和平移
-            # 将 [2.3, 6.58] 映射到 [-3, 3]
-            # mask = entropy > 0  # 找到非零熵
-            # entropy = torch.where(
-            #     mask,
-            #     ((entropy - 2.3) / 4.28) * 6 - 3, 
-            #     entropy  # 保持零不变
-            # )
-            # print(entropy)
+            logps = selective_log_softmax(logits, input_ids_batch)  # compute logprobs for the input tokens
             all_logps.append(logps)
-            all_masks.append(mask)
-            # all_entropy.append(entropy_overall)
+        return torch.cat(all_logps, dim=0)
+#     def _get_per_token_logps(
+#     self, model, input_ids, attention_mask, logits_to_keep, batch_size=None
+# ) -> tuple[torch.Tensor, torch.Tensor]:
+#     # """
+#     # 计算每个 token 的对数概率和熵
+    
+#     # 返回:
+#     #     logps: 每个 token 的对数概率, shape (B, logits_to_keep)
+#     #     entropy: 每个位置的熵 H_t, shape (B, logits_to_keep)
+#     # """
+#         batch_size = batch_size or input_ids.size(0)
+#         all_logps = []
+#         # all_entropy = []  # 新增：存储熵
+#         all_masks = []
+#         for i in range(0, input_ids.size(0), batch_size):
+#             input_ids_batch = input_ids[i : i + batch_size]
+#             attention_mask_batch = attention_mask[i : i + batch_size]
+    
+#             # 获取 logits
+#             logits = model(
+#                 input_ids=input_ids_batch, 
+#                 attention_mask=attention_mask_batch, 
+#                 logits_to_keep=logits_to_keep + 1
+#             ).logits
+            
+#             logits = logits[:, :-1, :]  # (B, L-1, V)
+#             input_ids_batch = input_ids_batch[:, -logits_to_keep:]
+#             logits = logits[:, -logits_to_keep:]
+            
+#             # 应用温度
+#             logits = logits / self.temperature
+            
+#             # 计算选定 token 的 log prob（原有功能）
+#             logps = selective_log_softmax(logits, input_ids_batch)
+            
+#             # === 新增：计算每个位置的熵 ===
+#             # 1. 计算整个词汇表的概率分布
+#             probs = torch.softmax(logits, dim=-1)  # (B, L, V)
+            
+#             # 2. 计算 log probs
+#             log_probs = torch.log_softmax(logits, dim=-1)  # (B, L, V)
+            
+#             # 3. 计算熵: H_t = -sum(p(v) * log(p(v)))
+            
+#             entropy = -torch.sum(probs * log_probs, dim=-1)  # (B, L)
+#             threshold = 2.632
+#             mask = (entropy > threshold).to(dtype=logps.dtype)  # dtype: torch.float32, shape: (B, L)
+#             # 注意：这等价于 H = -E[log p]
+#             # entropy_per_sample = entropy.mean(dim=1)  # (B,)
+
+#             # 步骤2：对所有样本求平均（沿着 B 维度）
+#             # entropy_overall = entropy_per_sample.mean(dim=0)  # 标量
+#             # entropy_threshold = 5.264
+#             # entropy = torch.where(
+#             #     entropy >= entropy_threshold, entropy, torch.zeros_like(entropy)
+#             # )
+
+#             # ✅ 新增: 对非零熵进行缩放和平移
+#             # 将 [2.3, 6.58] 映射到 [-3, 3]
+#             # mask = entropy > 0  # 找到非零熵
+#             # entropy = torch.where(
+#             #     mask,
+#             #     ((entropy - 2.3) / 4.28) * 6 - 3, 
+#             #     entropy  # 保持零不变
+#             # )
+#             # print(entropy)
+#             all_logps.append(logps)
+#             all_masks.append(mask)
+#             # all_entropy.append(entropy_overall)
         
-        return torch.cat(all_logps, dim=0), torch.cat(all_masks, dim=0)
+#         return torch.cat(all_logps, dim=0), torch.cat(all_masks, dim=0)
 
     def _sync_fsdp_params_to_vllm(self, module: nn.Module, prefix: str = "", visited=None):
         """Memory-efficient post-order traversal of FSDP modules to extract full parameters and sync with vLLM."""
@@ -1201,10 +1201,10 @@ class GRPOTrainer(Trainer):
             # old_per_token_logps == per_token_logps, so we can skip it's computation here, and use
             # per_token_logps.detach() instead.
             if self.num_iterations > 1 or self.args.steps_per_generation > self.args.gradient_accumulation_steps:
-                old_per_token_logps, _= self._get_per_token_logps(
+                old_per_token_logps = self._get_per_token_logps(
                     self.model, prompt_completion_ids, attention_mask, logits_to_keep, batch_size
                 )
-                del _
+                # del _
             else:
                 old_per_token_logps = None
 
@@ -1348,16 +1348,16 @@ class GRPOTrainer(Trainer):
         if self.beta != 0.0:
             with torch.no_grad():
                 if self.ref_model is not None:
-                    ref_per_token_logps, _ = self._get_per_token_logps(
+                    ref_per_token_logps = self._get_per_token_logps(
                         self.ref_model, input_ids, attention_mask, logits_to_keep
                     )
-                    del _
+                    # del _
                 else:
                     with self.accelerator.unwrap_model(self.model).disable_adapter():
-                        ref_per_token_logps, _ = self._get_per_token_logps(
+                        ref_per_token_logps = self._get_per_token_logps(
                             self.model, input_ids, attention_mask, logits_to_keep
                         )
-                        del _
+                        # del _
 
         # get the last hidden state of the model
         last_hidden_state = self._get_last_hidden_state(unwrapped_model, input_ids, attention_mask, logits_to_keep)
@@ -1403,22 +1403,23 @@ class GRPOTrainer(Trainer):
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
         logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
 
-        per_token_logps, mask = self._get_per_token_logps(model, input_ids, attention_mask, logits_to_keep)
+        per_token_logps = self._get_per_token_logps(model, input_ids, attention_mask, logits_to_keep)
+        # per_token_logps, mask = self._get_per_token_logps(model, input_ids, attention_mask, logits_to_keep)
 
         # Compute the KL divergence between the model and the reference model
         if self.beta != 0.0:
             with torch.no_grad():
                 if self.ref_model is not None:
-                    ref_per_token_logps, _ = self._get_per_token_logps(
+                    ref_per_token_logps = self._get_per_token_logps(
                         self.ref_model, input_ids, attention_mask, logits_to_keep
                     )
-                    del _
+                    # del _
                 else:
                     with self.accelerator.unwrap_model(self.model).disable_adapter():
-                        ref_per_token_logps, _ = self._get_per_token_logps(
+                        ref_per_token_logps = self._get_per_token_logps(
                             self.model, input_ids, attention_mask, logits_to_keep
                         )
-                        del _
+                        # del _
             per_token_kl = (
                 torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
             )
@@ -1442,7 +1443,8 @@ class GRPOTrainer(Trainer):
         per_token_loss2 = coef_2 * advantages.unsqueeze(1)
         per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
         if self.beta != 0.0:
-            per_token_loss = per_token_loss * mask + self.beta * per_token_kl
+            per_token_loss = per_token_loss + self.beta * per_token_kl
+            # per_token_loss = per_token_loss * mask + self.beta * per_token_kl
 
         if self.loss_type == "grpo":
             loss = ((per_token_loss * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)).mean()
