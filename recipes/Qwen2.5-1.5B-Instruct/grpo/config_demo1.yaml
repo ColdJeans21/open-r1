@@ -1,7 +1,8 @@
 # Model arguments
 # model_name_or_path: /home/gml/xz/distilgpt2 
 # model_name_or_path: /home/gml/.cache/modelscope/hub/models/Qwen/Qwen2.5-1.5B-Instruct
-model_name_or_path: /home/gml/xz/Qwen3_0.6B-base
+# model_name_or_path: /home/gml/xz/Qwen3_0.6B/home/gml/xz/Qwen3-0.6B-Math-Expert
+model_name_or_path: /home/gml/xz/Qwen3-0.6B-Math-Expert
 # model_name_or_path: distilbert/distilgpt2
 model_revision: main
 torch_dtype: bfloat16
@@ -9,8 +10,7 @@ attn_implementation: flash_attention_2
 
 # Data training arguments
 dataset_name: knoveleng/open-rs # open-r1/OpenR1-Math-220k
-# dataset_name: open-r1/OpenR1-Math-220k
-# dataset_name: /home/gml/xz/dataset/openai_gsm8k
+# dataset_name: /home/gml/xz/dataset/openai_gsm8k # open-r1/OpenR1-Math-220k
 dataset_prompt_column: problem
 # system_prompt: "You are a helpful AI Assistant that provides well-reasoned and detailed responses. You first think about the reasoning process as an internal monologue and then provide the user with the answer. Respond in the following format: <think>\n...\n</think>\n<answer>\n...\n</answer>"
 system_prompt: "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant first thinks about the reasoning process in the mind and then provides the user with the answer, and put your final answer within \\boxed{{}} . The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think> <answer> answer here </answer>. Note that respond by English, NOT use other languages."
@@ -18,6 +18,7 @@ system_prompt: "A conversation between User and Assistant. The user asks a quest
 bf16: true
 use_vllm: true
 do_eval: false
+# eval_dataset: /home/gml/xz/dataset/AIME_24
 gradient_accumulation_steps: 8
 gradient_checkpointing: true
 use_liger_loss: false
@@ -35,12 +36,13 @@ lr_scheduler_type: cosine
 max_prompt_length: 512
 max_completion_length: 1024
 max_steps: 500 # -1
-num_generations: 2
+num_generations: 4
 num_train_epochs: 1
-output_dir: /home/gml/xz/Qwen3_0.6B-base-Open-R1-GRPO # data/Qwen2.5-1.5B-Open-R1-GRPO
+# output_dir: /home/gml/xz/distilgpt2-Open-R1-GRPO # data/Qwen2.5-1.5B-Open-R1-GRPO /home/gml/xz/Qwen3-0.6B-Math-Expert
+output_dir: /home/gml/xz/Qwen3-0.6B-Math-Expert-Open-R1-GRPO
 overwrite_output_dir: true
 per_device_eval_batch_size: 1
-per_device_train_batch_size: 2
+per_device_train_batch_size: 4
 push_to_hub: false
 report_to:
 - wandb
@@ -57,3 +59,4 @@ wandb_log_unique_prompts: false
 save_total_limit: 1
 seed: 42
 warmup_ratio: 0.1
+
