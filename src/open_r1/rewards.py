@@ -37,75 +37,19 @@ from .utils.competitive_programming import score_submission as cf_score_submissi
 from .utils.competitive_programming import score_subtask
 
 
-def accuracy_reward(completions: list[list[dict[str, str]]], correct: list[str], **kwargs) -> list[Optional[float]]:
-    """Reward function that checks if the completion is the same as the ground truth."""
-    # 提取所有完成结果的核心内容（保持原有逻辑）
-    contents = [completion[0]["content"] for completion in completions]
-    rewards = []
-    
-    # 遍历每个完成结果与对应的正确答案（completions与correct长度需一致）
-    for content, correct_str in zip(contents, correct):
-        # 直接使用列表中的正确答案字符串，去除首尾空白避免格式干扰
-        gold_parsed = correct_str.strip()
-        
-        if gold_parsed:  # 若当前正确答案非空
-            # 解析模型输出的内容（保持原有Latex解析配置不变）
-            answer_parsed = parse(
-                content,
-                extraction_config=[
-                    LatexExtractionConfig(
-                        normalization_config=NormalizationConfig(
-                            nits=False,
-                            malformed_operators=False,
-                            basic_latex=True,
-                            equations=True,
-                            boxed="all",
-                            units=True,
-                        ),
-                        boxed_match_priority=0,  # 优先匹配boxed包裹的答案
-                        try_extract_without_anchor=False,
-                    )
-                ],
-                extraction_mode="first_match",
-            )
-            
-            # 计算二分类奖励（可验证则返回0.0/1.0，失败则返回None）
-            try:
-                # 验证模型解析结果与正确答案是否一致
-                reward = float(verify(gold_parsed, answer_parsed))
-            except Exception as e:
-                print(f"验证失败: {e}, 模型输出解析结果: {answer_parsed}, 正确答案: {gold_parsed}")
-                reward = None
-        else:
-            # 若当前正确答案为空字符串，跳过该示例
-            reward = None
-            print("正确答案为空字符串，跳过验证")
-        
-        rewards.append(reward)
-
-    return rewards
-
-
-# def accuracy_reward(completions: list[list[dict[str, str]]], answer: list[str], **kwargs) -> list[Optional[float]]:
+# def accuracy_reward(completions: list[list[dict[str, str]]], correct: list[str], **kwargs) -> list[Optional[float]]:
 #     """Reward function that checks if the completion is the same as the ground truth."""
+#     # 提取所有完成结果的核心内容（保持原有逻辑）
 #     contents = [completion[0]["content"] for completion in completions]
 #     rewards = []
-#     for content, sol in zip(contents, answer):
-#         # -------------------------- 预处理真实答案，提取 #### 后的最终答案 --------------------------
-#         match = re.search(r"####\s*(\d+)", sol)  # 匹配 "#### 数字" 格式（支持整数）
-#         # 若需支持小数/分数，将正则改为：r"####\s*([\d.\/]+)"
-#         if match:
-#             processed_sol = match.group(1)  # 提取纯答案（如 "16"、"16.5"、"3/4"）
-#         else:
-#             processed_sol = sol  # 未匹配到则保留原文本（兼容其他格式）
-#         # --------------------------------------------------------------------------------------------------
-
-#         # 核心修改：直接将预处理后的纯答案作为 gold_parsed，跳过 parse 解析
-#         gold_parsed = processed_sol
-
-#         # 仅保留非空判断（确保有有效答案）
-#         if gold_parsed:
-#             # 模型答案解析部分保持不变（仍用原逻辑提取模型答案）
+    
+#     # 遍历每个完成结果与对应的正确答案（completions与correct长度需一致）
+#     for content, correct_str in zip(contents, correct):
+#         # 直接使用列表中的正确答案字符串，去除首尾空白避免格式干扰
+#         gold_parsed = correct_str.strip()
+        
+#         if gold_parsed:  # 若当前正确答案非空
+#             # 解析模型输出的内容（保持原有Latex解析配置不变）
 #             answer_parsed = parse(
 #                 content,
 #                 extraction_config=[
@@ -118,24 +62,80 @@ def accuracy_reward(completions: list[list[dict[str, str]]], correct: list[str],
 #                             boxed="all",
 #                             units=True,
 #                         ),
-#                         boxed_match_priority=0,
+#                         boxed_match_priority=0,  # 优先匹配boxed包裹的答案
 #                         try_extract_without_anchor=False,
 #                     )
 #                 ],
 #                 extraction_mode="first_match",
 #             )
+            
+#             # 计算二分类奖励（可验证则返回0.0/1.0，失败则返回None）
 #             try:
-#                 # 若 verify 函数要求输入为字符串，直接对比；若要求结构化对象，需调整（见下方说明）
+#                 # 验证模型解析结果与正确答案是否一致
 #                 reward = float(verify(gold_parsed, answer_parsed))
 #             except Exception as e:
-#                 print(f"verify failed: {e}, answer: {answer_parsed}, gold: {gold_parsed}")
+#                 print(f"验证失败: {e}, 模型输出解析结果: {answer_parsed}, 正确答案: {gold_parsed}")
 #                 reward = None
 #         else:
+#             # 若当前正确答案为空字符串，跳过该示例
 #             reward = None
-#             print("Failed to parse gold solution: processed_sol is empty")
+#             print("正确答案为空字符串，跳过验证")
+        
 #         rewards.append(reward)
 
 #     return rewards
+
+
+def accuracy_reward(completions: list[list[dict[str, str]]], answer: list[str], **kwargs) -> list[Optional[float]]:
+    """Reward function that checks if the completion is the same as the ground truth."""
+    contents = [completion[0]["content"] for completion in completions]
+    rewards = []
+    for content, sol in zip(contents, answer):
+        # -------------------------- 预处理真实答案，提取 #### 后的最终答案 --------------------------
+        match = re.search(r"####\s*(\d+)", sol)  # 匹配 "#### 数字" 格式（支持整数）
+        # 若需支持小数/分数，将正则改为：r"####\s*([\d.\/]+)"
+        if match:
+            processed_sol = match.group(1)  # 提取纯答案（如 "16"、"16.5"、"3/4"）
+        else:
+            processed_sol = sol  # 未匹配到则保留原文本（兼容其他格式）
+        # --------------------------------------------------------------------------------------------------
+
+        # 核心修改：直接将预处理后的纯答案作为 gold_parsed，跳过 parse 解析
+        gold_parsed = processed_sol
+
+        # 仅保留非空判断（确保有有效答案）
+        if gold_parsed:
+            # 模型答案解析部分保持不变（仍用原逻辑提取模型答案）
+            answer_parsed = parse(
+                content,
+                extraction_config=[
+                    LatexExtractionConfig(
+                        normalization_config=NormalizationConfig(
+                            nits=False,
+                            malformed_operators=False,
+                            basic_latex=True,
+                            equations=True,
+                            boxed="all",
+                            units=True,
+                        ),
+                        boxed_match_priority=0,
+                        try_extract_without_anchor=False,
+                    )
+                ],
+                extraction_mode="first_match",
+            )
+            try:
+                # 若 verify 函数要求输入为字符串，直接对比；若要求结构化对象，需调整（见下方说明）
+                reward = float(verify(gold_parsed, answer_parsed))
+            except Exception as e:
+                print(f"verify failed: {e}, answer: {answer_parsed}, gold: {gold_parsed}")
+                reward = None
+        else:
+            reward = None
+            print("Failed to parse gold solution: processed_sol is empty")
+        rewards.append(reward)
+
+    return rewards
 
 # def accuracy_reward(completions: list[list[dict[str, str]]], solution: list[str], **kwargs) -> list[Optional[float]]:
 #     """Reward function that checks if the completion is the same as the ground truth."""

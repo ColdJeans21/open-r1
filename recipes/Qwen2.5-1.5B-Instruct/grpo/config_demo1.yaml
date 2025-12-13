@@ -7,10 +7,11 @@ model_name_or_path: /home/gml/xz/Qwen3-0.6B-Math-Expert
 model_revision: main
 torch_dtype: bfloat16
 attn_implementation: flash_attention_2
-
+# resume_from_checkpoint: /home/gml/xz/Qwen3-0.6B-Math-Expert
 # Data training arguments
-dataset_name: openai/gsm8k # knoveleng/open-rs # open-r1/OpenR1-Math-220k
+dataset_name: openai/gsm8k #allenai/math_qa # knoveleng/open-rs # open-r1/OpenR1-Math-220k
 # dataset_name: /home/gml/xz/dataset/openai_gsm8k # open-r1/OpenR1-Math-220k
+# dataset_prompt_column: Problem, options
 dataset_prompt_column: question
 dataset_split: train
 dataset_config: main
@@ -41,7 +42,7 @@ max_steps: 500 # -1
 num_generations: 4
 num_train_epochs: 1
 # output_dir: /home/gml/xz/distilgpt2-Open-R1-GRPO # data/Qwen2.5-1.5B-Open-R1-GRPO /home/gml/xz/Qwen3-0.6B-Math-Expert
-output_dir: /home/gml/xz/Qwen3-0.6B-Math-Expert-Open-R1-GRPO-gsm8k
+output_dir: /home/gml/xz/Qwen3-0.6B-Math-Expert-I(H>threshold)+grpo+token_level/to_500steps
 overwrite_output_dir: true
 per_device_eval_batch_size: 1
 per_device_train_batch_size: 4
@@ -50,11 +51,11 @@ push_to_hub: false
 # - wandb
 reward_funcs:
 - accuracy
-- format
+# - format
 - tag_count
 reward_weights:
 - 1.0
-- 1.0
+# - 1.0
 - 1.0
 save_strategy: "steps"
 wandb_log_unique_prompts: false

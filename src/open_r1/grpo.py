@@ -88,55 +88,55 @@ def main(script_args, training_args, model_args):
     reward_funcs = get_reward_funcs(script_args)
 
     # Format into conversation
-    # def make_conversation(example, prompt_column: str = script_args.dataset_prompt_column):
-    #     prompt = []
-
-    #     if training_args.system_prompt is not None:
-    #         prompt.append({"role": "system", "content": training_args.system_prompt})
-
-    #     if prompt_column not in example:
-    #         raise ValueError(f"Dataset Question Field Error: {prompt_column} is not supported.")
-
-    #     prompt.append({"role": "user", "content": example[prompt_column]})
-    #     return {"prompt": prompt}
     def make_conversation(example, prompt_column: str = script_args.dataset_prompt_column):
         prompt = []
 
         if training_args.system_prompt is not None:
             prompt.append({"role": "system", "content": training_args.system_prompt})
 
-        # 支持逗号分隔的多列名，也支持直接传入 list/tuple
-        if isinstance(prompt_column, str):
-            cols = [c.strip() for c in prompt_column.split(",") if c.strip()]
-        elif isinstance(prompt_column, (list, tuple)):
-            cols = list(prompt_column)
-        else:
-            cols = [prompt_column]
+        if prompt_column not in example:
+            raise ValueError(f"Dataset Question Field Error: {prompt_column} is not supported.")
 
-        # 检查每个列是否在 example 中存在
-        for col in cols:
-            if col not in example:
-                raise ValueError(f"Dataset Question Field Error: {col} is not supported.")
-
-        # 把这些列的内容合并成一个字符串，列表类型（如 options 列为 list）会被格式化为 A. ..., B. ...
-        parts = []
-        for col in cols:
-            val = example.get(col, "")
-            if isinstance(val, (list, tuple)):
-                formatted_opts = []
-                for i, v in enumerate(val):
-                    try:
-                        label = chr(65 + i)  # A, B, C...
-                    except Exception:
-                        label = str(i + 1)
-                    formatted_opts.append(f"{label}. {v}")
-                parts.append("\n".join(formatted_opts))
-            else:
-                parts.append(str(val) if val is not None else "")
-
-        combined = "\n\n".join([p for p in parts if p != ""])
-        prompt.append({"role": "user", "content": combined + "\nSelect the correct option."})
+        prompt.append({"role": "user", "content": example[prompt_column]})
         return {"prompt": prompt}
+    # def make_conversation(example, prompt_column: str = script_args.dataset_prompt_column):
+    #     prompt = []
+
+    #     if training_args.system_prompt is not None:
+    #         prompt.append({"role": "system", "content": training_args.system_prompt})
+
+    #     # 支持逗号分隔的多列名，也支持直接传入 list/tuple
+    #     if isinstance(prompt_column, str):
+    #         cols = [c.strip() for c in prompt_column.split(",") if c.strip()]
+    #     elif isinstance(prompt_column, (list, tuple)):
+    #         cols = list(prompt_column)
+    #     else:
+    #         cols = [prompt_column]
+
+    #     # 检查每个列是否在 example 中存在
+    #     for col in cols:
+    #         if col not in example:
+    #             raise ValueError(f"Dataset Question Field Error: {col} is not supported.")
+
+    #     # 把这些列的内容合并成一个字符串，列表类型（如 options 列为 list）会被格式化为 A. ..., B. ...
+    #     parts = []
+    #     for col in cols:
+    #         val = example.get(col, "")
+    #         if isinstance(val, (list, tuple)):
+    #             formatted_opts = []
+    #             for i, v in enumerate(val):
+    #                 try:
+    #                     label = chr(65 + i)  # A, B, C...
+    #                 except Exception:
+    #                     label = str(i + 1)
+    #                 formatted_opts.append(f"{label}. {v}")
+    #             parts.append("\n".join(formatted_opts))
+    #         else:
+    #             parts.append(str(val) if val is not None else "")
+
+    #     combined = "\n\n".join([p for p in parts if p != ""])
+    #     prompt.append({"role": "user", "content": combined + "\nSelect the correct option."})
+    #     return {"prompt": prompt}
 
     dataset = dataset.map(make_conversation)
 
