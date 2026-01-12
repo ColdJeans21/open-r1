@@ -37,53 +37,25 @@ from .utils.competitive_programming import score_submission as cf_score_submissi
 from .utils.competitive_programming import score_subtask
 
 
-# def accuracy_reward(completions: list[list[dict[str, str]]], correct: list[str], **kwargs) -> list[Optional[float]]:
-#     """Reward function that checks if the completion is the same as the ground truth."""
-#     # 提取所有完成结果的核心内容（保持原有逻辑）
-#     contents = [completion[0]["content"] for completion in completions]
-#     rewards = []
-    
-#     # 遍历每个完成结果与对应的正确答案（completions与correct长度需一致）
-#     for content, correct_str in zip(contents, correct):
-#         # 直接使用列表中的正确答案字符串，去除首尾空白避免格式干扰
-#         gold_parsed = correct_str.strip()
-        
-#         if gold_parsed:  # 若当前正确答案非空
-#             # 解析模型输出的内容（保持原有Latex解析配置不变）
-#             answer_parsed = parse(
-#                 content,
-#                 extraction_config=[
-#                     LatexExtractionConfig(
-#                         normalization_config=NormalizationConfig(
-#                             nits=False,
-#                             malformed_operators=False,
-#                             basic_latex=True,
-#                             equations=True,
-#                             boxed="all",
-#                             units=True,
-#                         ),
-#                         boxed_match_priority=0,  # 优先匹配boxed包裹的答案
-#                         try_extract_without_anchor=False,
-#                     )
-#                 ],
-#                 extraction_mode="first_match",
-#             )
-            
-#             # 计算二分类奖励（可验证则返回0.0/1.0，失败则返回None）
-#             try:
-#                 # 验证模型解析结果与正确答案是否一致
-#                 reward = float(verify(gold_parsed, answer_parsed))
-#             except Exception as e:
-#                 print(f"验证失败: {e}, 模型输出解析结果: {answer_parsed}, 正确答案: {gold_parsed}")
-#                 reward = None
-#         else:
-#             # 若当前正确答案为空字符串，跳过该示例
-#             reward = None
-#             print("正确答案为空字符串，跳过验证")
-        
-#         rewards.append(reward)
+import torch
+import torch.nn.functional as F
 
-#     return rewards
+
+
+
+# 标记类
+class LogitsBasedReward:
+    """需要 logits 作为输入的奖励函数基类"""
+    pass
+
+
+# 简单的标记对象
+class EntropyRewardMarker(LogitsBasedReward):
+    """熵奖励标记，实际计算在 trainer 中"""
+    __name__ = "entropy_reward"
+
+entropy_reward = EntropyRewardMarker()
+
 
 
 def accuracy_reward(completions: list[list[dict[str, str]]], answer: list[str], **kwargs) -> list[Optional[float]]:
@@ -136,6 +108,49 @@ def accuracy_reward(completions: list[list[dict[str, str]]], answer: list[str], 
         rewards.append(reward)
 
     return rewards
+# def accuracy_reward(completions: list[list[dict[str, str]]], solution: list[str], **kwargs) -> list[Optional[float]]:
+#     """Reward function that checks if the completion is the same as the ground truth."""
+#     contents = [completion[0]["content"] for completion in completions]
+#     rewards = []
+#     for content, sol in zip(contents, solution):
+#         gold_parsed = parse(
+#             sol,
+#             extraction_mode="first_match",
+#         )
+#         if len(gold_parsed) != 0:
+#             # We require the answer to be provided in correct latex (no malformed operators)
+#             answer_parsed = parse(
+#                 content,
+#                 extraction_config=[
+#                     LatexExtractionConfig(
+#                         normalization_config=NormalizationConfig(
+#                             nits=False,
+#                             malformed_operators=False,
+#                             basic_latex=True,
+#                             equations=True,
+#                             boxed="all",
+#                             units=True,
+#                         ),
+#                         # Ensures that boxed is tried first
+#                         boxed_match_priority=0,
+#                         try_extract_without_anchor=False,
+#                     )
+#                 ],
+#                 extraction_mode="first_match",
+#             )
+#             # Compute binary rewards if verifiable, `None` otherwise to skip this example
+#             try:
+#                 reward = float(verify(gold_parsed, answer_parsed))
+#             except Exception as e:
+#                 print(f"verify failed: {e}, answer: {answer_parsed}, gold: {gold_parsed}")
+#                 reward = None
+#         else:
+#             # If the gold solution is not parseable, we assign `None` to skip this example
+#             reward = None
+#             print("Failed to parse gold solution: ", sol)
+#         rewards.append(reward)
+
+#     return rewards
 
 # def accuracy_reward(completions: list[list[dict[str, str]]], solution: list[str], **kwargs) -> list[Optional[float]]:
 #     """Reward function that checks if the completion is the same as the ground truth."""
@@ -747,6 +762,7 @@ def get_reward_funcs(script_args) -> list[Callable]:
     REWARD_FUNCS_REGISTRY = {
         "accuracy": accuracy_reward,
         "format": format_reward,
+        "entropy_reward": entropy_reward,
         "reasoning_steps": reasoning_steps_reward,
         "cosine": get_cosine_scaled_reward(
             min_value_wrong=script_args.cosine_min_value_wrong,

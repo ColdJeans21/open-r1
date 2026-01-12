@@ -244,6 +244,10 @@ class GRPOConfig(TrainingArguments):
             "* gradient_accumulation_steps) must be evenly divisible by this value."
         },
     )
+    entropy_threshold: float = field(
+        default=1.0,
+        metadata={"help": "Threshold for entropy reward. Only tokens with entropy above this value are considered."},
+    )
     max_completion_length: Optional[int] = field(
         default=256,
         metadata={"help": "Maximum length of the generated completion."},
@@ -343,7 +347,14 @@ class GRPOConfig(TrainingArguments):
         default=None,
         metadata={"help": "Regex for vLLM guided decoding. If `None` (default), guided decoding is disabled."},
     )
-
+    entropy_clip_min: float = field(
+    default=0.0,
+    metadata={"help": "Minimum value for entropy reward clipping."},
+)
+    entropy_clip_max: float = field(
+        default=0.5,
+        metadata={"help": "Maximum value for entropy reward clipping."},
+    )
     # Parameters that control the vLLM server (only used when `vllm_mode` is `"server"`)
     vllm_server_host: str = field(
         default="0.0.0.0",
