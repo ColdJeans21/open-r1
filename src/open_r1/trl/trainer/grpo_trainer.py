@@ -61,8 +61,8 @@ from .utils import (
     print_prompt_completions_sample,
     selective_log_softmax,
 )
-
-
+from open_r1.rewards import LogitsBasedReward
+import torch.nn.functional as F
 if is_peft_available():
     from peft import PeftConfig, get_peft_model
 
@@ -495,6 +495,9 @@ class GRPOTrainer(Trainer):
         self.top_p = args.top_p
         self.top_k = args.top_k
         self.min_p = args.min_p
+        # 熵相关参数
+        self.entropy_clip_min = args.entropy_clip_min
+        self.entropy_clip_max = args.entropy_clip_max
         self.repetition_penalty = args.repetition_penalty
         self.use_vllm = args.use_vllm
         self.vllm_mode = args.vllm_mode
@@ -504,7 +507,7 @@ class GRPOTrainer(Trainer):
         self.loss_type = args.loss_type
         self.scale_rewards = args.scale_rewards
         self.mask_truncated_completions = args.mask_truncated_completions
-
+        self.entropy_threshold = args.entropy_threshold
         # Datasets
         self.shuffle_dataset = args.shuffle_dataset
 
@@ -833,99 +836,149 @@ class GRPOTrainer(Trainer):
 
     # Get the per-token log probabilities for the completions for the model and the reference model
     @profiling_decorator
-    def _get_per_token_logps(self, model, input_ids, attention_mask, logits_to_keep, batch_size=None) -> torch.Tensor:
-        batch_size = batch_size or input_ids.size(0)  # Chunk inputs into smaller batches to reduce memory peak
+    # def _get_per_token_logps(
+    #     self, model, input_ids, attention_mask, logits_to_keep, batch_size=None, return_logits=False
+    # ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+    #     batch_size = batch_size or input_ids.size(0)
+    #     all_logps = []
+    #     all_logits = [] if return_logits else None
+        
+    #     for i in range(0, input_ids.size(0), batch_size):
+    #         input_ids_batch = input_ids[i : i + batch_size]
+    #         attention_mask_batch = attention_mask[i : i + batch_size]
+
+    #         logits = model(
+    #             input_ids=input_ids_batch, attention_mask=attention_mask_batch, logits_to_keep=logits_to_keep + 1
+    #         ).logits
+    #         logits = logits[:, :-1, :]
+    #         input_ids_batch = input_ids_batch[:, -logits_to_keep:]
+    #         logits = logits[:, -logits_to_keep:]
+            
+    #         if return_logits:
+    #             all_logits.append(logits.clone())
+            
+    #         logits = logits / self.temperature
+    #         logps = selective_log_softmax(logits, input_ids_batch)
+    #         all_logps.append(logps)
+        
+    #     if return_logits:
+    #         return torch.cat(all_logps, dim=0), torch.cat(all_logits, dim=0)
+    #     return torch.cat(all_logps, dim=0)
+    def _compute_entropy_reward_from_logits(
+        self,
+        logits: torch.Tensor,
+        completion_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        直接从 logits 计算熵奖励（在 batch 循环内调用，节省显存）
+        返回按行归一化后的熵奖励（未乘以系数，系数在后续计算）
+        
+        Args:
+            logits: (batch_size, seq_len, vocab_size)
+            completion_mask: (batch_size, seq_len)
+            
+        Returns:
+            rewards: (batch_size,)
+        """
+        threshold = self.entropy_threshold
+        epsilon = 1e-8
+        
+        # 计算熵（不除以温度，使用原始 logits）
+        probs = F.softmax(logits, dim=-1)
+        log_probs = F.log_softmax(logits, dim=-1)
+        entropy = -torch.sum(probs * log_probs, dim=-1)  # (B, L)
+        
+        # 应用 mask
+        entropy = entropy * completion_mask
+        
+        # 筛选大于阈值的熵
+        threshold_mask = (entropy > threshold) & (completion_mask > 0)
+        
+        # ========== 修改1：按行进行归一化 ==========
+        batch_size = entropy.size(0)
+        normalized_entropy = torch.zeros_like(entropy)
+        
+        for row_idx in range(batch_size):
+            row_mask = threshold_mask[row_idx]  # (L,)
+            row_entropy = entropy[row_idx]  # (L,)
+            
+            selected_values = row_entropy[row_mask]
+            
+            if selected_values.numel() > 1:
+                min_val = selected_values.min()
+                max_val = selected_values.max()
+                if max_val - min_val > epsilon:
+                    # 按行归一化
+                    norm_values = (selected_values - min_val) / (max_val - min_val)
+                    normalized_entropy[row_idx][row_mask] = norm_values
+                else:
+                    normalized_entropy[row_idx][row_mask] = 0.5
+            elif selected_values.numel() == 1:
+                normalized_entropy[row_idx][row_mask] = 1.0
+        
+        # 计算基础奖励（未乘以系数）
+        valid_counts = threshold_mask.sum(dim=-1).clamp(min=1)
+        rewards = normalized_entropy.sum(dim=-1) / valid_counts
+        
+        return rewards
+    
+    
+    def _get_per_token_logps(
+        self, model, input_ids, attention_mask, logits_to_keep, batch_size=None, 
+        return_logits=False, compute_entropy=False, completion_mask=None
+    ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        """
+        计算 per-token log probs，可选同时计算熵奖励（节省显存）
+        
+        Args:
+            return_logits: 是否返回完整 logits（显存消耗大，不推荐）
+            compute_entropy: 是否计算熵奖励（推荐，显存友好）
+            completion_mask: 计算熵时需要的 mask
+        """
+        batch_size = batch_size or input_ids.size(0)
         all_logps = []
+        all_logits = [] if return_logits else None
+        all_entropy_rewards = [] if compute_entropy else None
+        
         for i in range(0, input_ids.size(0), batch_size):
             input_ids_batch = input_ids[i : i + batch_size]
             attention_mask_batch = attention_mask[i : i + batch_size]
 
-            # We add 1 to `logits_to_keep` because the last logits of the sequence is later excluded
             logits = model(
                 input_ids=input_ids_batch, attention_mask=attention_mask_batch, logits_to_keep=logits_to_keep + 1
             ).logits
-            logits = logits[:, :-1, :]  # (B, L-1, V), exclude the last logit: it corresponds to the next token pred
+            logits = logits[:, :-1, :]
             input_ids_batch = input_ids_batch[:, -logits_to_keep:]
-            # For transformers<=4.48, logits_to_keep argument isn't supported, so here we drop logits ourselves.
-            # See https://github.com/huggingface/trl/issues/2770
             logits = logits[:, -logits_to_keep:]
-            # Divide logits by sampling temperature.
-            # See https://huggingface.co/blog/the_n_implementation_details_of_rlhf_with_ppo#policy-training-implementation-details
+            
+            # 如果需要计算熵，在这里直接计算，不保存完整 logits
+            if compute_entropy and completion_mask is not None:
+                completion_mask_batch = completion_mask[i : i + batch_size]
+                entropy_reward = self._compute_entropy_reward_from_logits(
+                    logits, completion_mask_batch
+                )
+                all_entropy_rewards.append(entropy_reward)
+            
+            if return_logits:
+                all_logits.append(logits.clone())
+            
+            # 应用温度计算 log probs
             logits = logits / self.temperature
-            logps = selective_log_softmax(logits, input_ids_batch)  # compute logprobs for the input tokens
+            logps = selective_log_softmax(logits, input_ids_batch)
             all_logps.append(logps)
-        return torch.cat(all_logps, dim=0)
-#     def _get_per_token_logps(
-#     self, model, input_ids, attention_mask, logits_to_keep, batch_size=None
-# ) -> tuple[torch.Tensor, torch.Tensor]:
-#     # """
-#     # 计算每个 token 的对数概率和熵
-    
-#     # 返回:
-#     #     logps: 每个 token 的对数概率, shape (B, logits_to_keep)
-#     #     entropy: 每个位置的熵 H_t, shape (B, logits_to_keep)
-#     # """
-#         batch_size = batch_size or input_ids.size(0)
-#         all_logps = []
-#         # all_entropy = []  # 新增：存储熵
-#         all_masks = []
-#         for i in range(0, input_ids.size(0), batch_size):
-#             input_ids_batch = input_ids[i : i + batch_size]
-#             attention_mask_batch = attention_mask[i : i + batch_size]
-    
-#             # 获取 logits
-#             logits = model(
-#                 input_ids=input_ids_batch, 
-#                 attention_mask=attention_mask_batch, 
-#                 logits_to_keep=logits_to_keep + 1
-#             ).logits
             
-#             logits = logits[:, :-1, :]  # (B, L-1, V)
-#             input_ids_batch = input_ids_batch[:, -logits_to_keep:]
-#             logits = logits[:, -logits_to_keep:]
-            
-#             # 应用温度
-#             logits = logits / self.temperature
-            
-#             # 计算选定 token 的 log prob（原有功能）
-#             logps = selective_log_softmax(logits, input_ids_batch)
-            
-#             # === 新增：计算每个位置的熵 ===
-#             # 1. 计算整个词汇表的概率分布
-#             probs = torch.softmax(logits, dim=-1)  # (B, L, V)
-            
-#             # 2. 计算 log probs
-#             log_probs = torch.log_softmax(logits, dim=-1)  # (B, L, V)
-            
-#             # 3. 计算熵: H_t = -sum(p(v) * log(p(v)))
-            
-#             entropy = -torch.sum(probs * log_probs, dim=-1)  # (B, L)
-#             threshold = 2.632
-#             mask = (entropy > threshold).to(dtype=logps.dtype)  # dtype: torch.float32, shape: (B, L)
-#             # 注意：这等价于 H = -E[log p]
-#             # entropy_per_sample = entropy.mean(dim=1)  # (B,)
-
-#             # 步骤2：对所有样本求平均（沿着 B 维度）
-#             # entropy_overall = entropy_per_sample.mean(dim=0)  # 标量
-#             # entropy_threshold = 5.264
-#             # entropy = torch.where(
-#             #     entropy >= entropy_threshold, entropy, torch.zeros_like(entropy)
-#             # )
-
-#             # ✅ 新增: 对非零熵进行缩放和平移
-#             # 将 [2.3, 6.58] 映射到 [-3, 3]
-#             # mask = entropy > 0  # 找到非零熵
-#             # entropy = torch.where(
-#             #     mask,
-#             #     ((entropy - 2.3) / 4.28) * 6 - 3, 
-#             #     entropy  # 保持零不变
-#             # )
-#             # print(entropy)
-#             all_logps.append(logps)
-#             all_masks.append(mask)
-#             # all_entropy.append(entropy_overall)
+            # 显式删除 logits 释放显存
+            if not return_logits:
+                del logits
         
-#         return torch.cat(all_logps, dim=0), torch.cat(all_masks, dim=0)
+        result = torch.cat(all_logps, dim=0)
+        
+        if return_logits:
+            return result, torch.cat(all_logits, dim=0)
+        elif compute_entropy:
+            return result, torch.cat(all_entropy_rewards, dim=0)
+        return result
+    
 
     def _sync_fsdp_params_to_vllm(self, module: nn.Module, prefix: str = "", visited=None):
         """Memory-efficient post-order traversal of FSDP modules to extract full parameters and sync with vLLM."""
@@ -1051,6 +1104,306 @@ class GRPOTrainer(Trainer):
             inputs = self._generate_and_score_completions(generation_batch)
         return inputs
 
+    # def _generate_and_score_completions(
+    #     self, inputs: list[dict[str, Union[torch.Tensor, Any]]]
+    # ) -> dict[str, Union[torch.Tensor, Any]]:
+    #     device = self.accelerator.device
+    #     mode = "train" if self.model.training else "eval"
+
+    #     prompts = [x["prompt"] for x in inputs]
+    #     prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs]
+    #     prompt_inputs = self.processing_class(
+    #         text=prompts_text, return_tensors="pt", padding=True, padding_side="left", add_special_tokens=False
+    #     )
+    #     prompt_inputs = super()._prepare_inputs(prompt_inputs)
+    #     prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]
+
+    #     if self.max_prompt_length is not None:
+    #         prompt_ids = prompt_ids[:, -self.max_prompt_length :]
+    #         prompt_mask = prompt_mask[:, -self.max_prompt_length :]
+
+    #     # Generate completions using either vLLM or regular generation
+    #     if self.use_vllm:
+    #         # First, update the vLLM weights if needed
+    #         if self.state.global_step != self._last_loaded_step:
+    #             self._move_model_to_vllm()
+    #             self._last_loaded_step = self.state.global_step
+
+    #         # Generate completions using vLLM: gather all prompts and use them in a single call in the main process
+    #         if self.vllm_mode == "server":
+    #             all_prompts_text = gather_object(prompts_text)
+    #             if self.accelerator.is_main_process:
+    #                 # Since 'prompts' contains 'num_generations' duplicates, we first take unique prompts, and generate
+    #                 # num_generations outputs for each one. This is faster than generating outputs for each duplicate
+    #                 # prompt individually.
+    #                 ordered_set_of_prompts = all_prompts_text[:: self.num_generations]
+    #                 with profiling_context(self, "vLLM.generate"):
+    #                     completion_ids = self.vllm_client.generate(
+    #                         prompts=ordered_set_of_prompts,
+    #                         n=self.num_generations,
+    #                         repetition_penalty=self.repetition_penalty,
+    #                         temperature=self.temperature,
+    #                         top_p=self.top_p,
+    #                         top_k=-1 if self.top_k is None else self.top_k,
+    #                         min_p=0.0 if self.min_p is None else self.min_p,
+    #                         max_tokens=self.max_completion_length,
+    #                         guided_decoding_regex=self.guided_decoding_regex,
+    #                     )
+    #             else:
+    #                 completion_ids = [None] * len(all_prompts_text)
+    #             # Broadcast the completions from the main process to all processes, ensuring each process receives its
+    #             # corresponding slice.
+    #             completion_ids = broadcast_object_list(completion_ids, from_process=0)
+    #             process_slice = slice(
+    #                 self.accelerator.process_index * len(prompts),
+    #                 (self.accelerator.process_index + 1) * len(prompts),
+    #             )
+    #             completion_ids = completion_ids[process_slice]
+
+    #         # Generate completions using colocated vLLM instances: each device holds vLLM copy and work on their own batch of prompts
+    #         elif self.vllm_mode == "colocate":
+    #             if self.guided_decoding_regex:
+    #                 guided_decoding = GuidedDecodingParams(backend="outlines", regex=self.guided_decoding_regex)
+    #             else:
+    #                 guided_decoding = None
+    #             sampling_params = SamplingParams(
+    #                 n=1,  # vLLM on each GPU generates only 1 in colocate mode
+    #                 repetition_penalty=self.repetition_penalty,
+    #                 temperature=self.temperature,
+    #                 top_p=self.top_p,
+    #                 top_k=-1 if self.top_k is None else self.top_k,
+    #                 min_p=0.0 if self.min_p is None else self.min_p,
+    #                 max_tokens=self.max_completion_length,
+    #                 guided_decoding=guided_decoding,
+    #             )
+
+    #             if self.vllm_tensor_parallel_size > 1:
+    #                 # Gather prompts from all ranks in the TP group and flatten.
+    #                 # Each rank starts with its own prompts; after gathering, all ranks see the full group set.
+    #                 orig_size = len(prompts_text)
+    #                 gathered_prompts = [None for _ in range(self.vllm_tensor_parallel_size)]
+    #                 torch.distributed.all_gather_object(gathered_prompts, prompts_text, group=self.tp_group)
+    #                 all_prompts_text = [p for sublist in gathered_prompts for p in sublist]
+    #             else:
+    #                 all_prompts_text = prompts_text
+
+    #             with profiling_context(self, "vLLM.generate"):
+    #                 all_outputs = self.llm.generate(all_prompts_text, sampling_params=sampling_params, use_tqdm=False)
+
+    #             completion_ids = [output.token_ids for outputs in all_outputs for output in outputs.outputs]
+
+    #             if self.vllm_tensor_parallel_size > 1:
+    #                 # Slice completions for this rank within its TP group.
+    #                 # Each rank generates all outputs — we keep only our share.
+    #                 local_rank_in_group = torch.distributed.get_rank(group=self.tp_group)
+    #                 tp_slice = slice(local_rank_in_group * orig_size, (local_rank_in_group + 1) * orig_size)
+    #                 completion_ids = completion_ids[tp_slice]
+
+    #         # Pad the completions, and concatenate them with the prompts
+    #         completion_ids = [torch.tensor(ids, device=device) for ids in completion_ids]
+    #         completion_ids = pad(completion_ids, padding_value=self.processing_class.pad_token_id)
+    #         prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+    #     else:
+    #         # Regular generation path
+    #         with unwrap_model_for_generation(
+    #             self.model_wrapped, self.accelerator, gather_deepspeed3_params=self.args.ds3_gather_for_generation
+    #         ) as unwrapped_model:
+    #             with (
+    #                 FSDP.summon_full_params(self.model_wrapped, recurse=False)
+    #                 if self.is_fsdp_enabled
+    #                 else nullcontext()
+    #             ):
+    #                 prompt_completion_ids = unwrapped_model.generate(
+    #                     prompt_ids, attention_mask=prompt_mask, generation_config=self.generation_config
+    #                 )
+
+    #         # Compute prompt length and extract completion ids
+    #         prompt_length = prompt_ids.size(1)
+    #         prompt_ids = prompt_completion_ids[:, :prompt_length]
+    #         completion_ids = prompt_completion_ids[:, prompt_length:]
+
+    #     # Mask everything after the first EOS token
+    #     is_eos = completion_ids == self.processing_class.eos_token_id
+    #     eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)
+    #     eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
+    #     sequence_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
+    #     completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
+
+    #     # Convert tensor to a list of lists of token IDs. This will be passed to the reward function, avoiding the need
+    #     # to re-tokenize completions if the reward is computed from tokens.
+    #     completion_ids_list = [
+    #         [id.item() for id, m in zip(row, mask_row) if m] for row, mask_row in zip(completion_ids, completion_mask)
+    #     ]
+
+    #     # Sum along sequence dimension (dim=1) to get completion length per sequence, used for logging
+    #     completion_lengths = completion_mask.sum(1)
+
+    #     # If mask_truncated_completions is enabled, zero out truncated completions in completion_mask
+    #     if self.mask_truncated_completions:
+    #         truncated_completions = ~is_eos.any(dim=1)
+    #         completion_mask = completion_mask * (~truncated_completions).unsqueeze(1).int()
+
+    #     # Concatenate prompt_mask with completion_mask for logit computation
+    #     attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)  # (B, P+C)
+
+    #     logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
+    #     batch_size = self.args.per_device_train_batch_size if mode == "train" else self.args.per_device_eval_batch_size
+
+    #     # ========== 修改：检查是否有需要熵的奖励函数 ==========
+    #     has_entropy_reward = any(isinstance(rf, LogitsBasedReward) for rf in self.reward_funcs)
+        
+    #     entropy_rewards = None
+    #     with torch.no_grad():
+    #         if self.num_iterations > 1 or self.args.steps_per_generation > self.args.gradient_accumulation_steps:
+    #             if has_entropy_reward:
+    #                 # 同时计算 logps 和熵奖励，不保存完整 logits
+    #                 old_per_token_logps, entropy_rewards = self._get_per_token_logps(
+    #                     self.model, prompt_completion_ids, attention_mask, logits_to_keep, batch_size,
+    #                     compute_entropy=True, completion_mask=completion_mask
+    #                 )
+    #             else:
+    #                 old_per_token_logps = self._get_per_token_logps(
+    #                     self.model, prompt_completion_ids, attention_mask, logits_to_keep, batch_size
+    #                 )
+    #         else:
+    #             old_per_token_logps = None
+    #             if has_entropy_reward:
+    #                 # 只计算熵奖励
+    #                 _, entropy_rewards = self._get_per_token_logps(
+    #                     self.model, prompt_completion_ids, attention_mask, logits_to_keep, batch_size,
+    #                     compute_entropy=True, completion_mask=completion_mask
+    #                 )
+
+    #     completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
+    #     if is_conversational(inputs[0]):
+    #         completions = []
+    #         for prompt, completion in zip(prompts, completions_text):
+    #             bootstrap = prompt.pop()["content"] if prompt[-1]["role"] == "assistant" else ""
+    #             completions.append([{"role": "assistant", "content": bootstrap + completion}])
+    #     else:
+    #         completions = completions_text
+
+    #     rewards_per_func = torch.zeros(len(prompts), len(self.reward_funcs), device=device)
+
+    #     keys = [key for key in inputs[0] if key not in ["prompt", "completion", "completion_ids"]]
+    #     reward_kwargs = {key: [example[key] for example in inputs] for key in keys}
+
+    #     for i, (reward_func, reward_processing_class, reward_func_name) in enumerate(
+    #         zip(self.reward_funcs, self.reward_processing_classes, self.reward_func_names)
+    #     ):
+    #         with profiling_context(self, reward_func_name):
+    #             # ========== 修改：对于熵奖励，直接使用预先计算的结果 ==========
+    #             if isinstance(reward_func, LogitsBasedReward):
+    #                 # 直接使用预先计算的熵奖励
+    #                 if entropy_rewards is not None:
+    #                     rewards_per_func[:, i] = entropy_rewards
+    #                 else:
+    #                     rewards_per_func[:, i] = torch.zeros(len(prompts), device=device)
+    #             elif isinstance(reward_func, nn.Module):
+    #                 if is_conversational(inputs[0]):
+    #                     messages = [{"messages": p + c} for p, c in zip(prompts, completions)]
+    #                     texts = [apply_chat_template(x, reward_processing_class)["text"] for x in messages]
+    #                 else:
+    #                     texts = [p + c for p, c in zip(prompts, completions)]
+    #                 reward_inputs = reward_processing_class(
+    #                     text=texts, return_tensors="pt", padding=True, padding_side="right", add_special_tokens=False
+    #                 )
+    #                 reward_inputs = super()._prepare_inputs(reward_inputs)
+    #                 with torch.inference_mode():
+    #                     rewards_per_func[:, i] = reward_func(**reward_inputs).logits[:, 0]
+    #             else:
+    #                 output_reward_func = reward_func(
+    #                     prompts=prompts, completions=completions, completion_ids=completion_ids_list, **reward_kwargs
+    #                 )
+    #                 output_reward_func = [reward if reward is not None else torch.nan for reward in output_reward_func]
+    #                 rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
+
+
+    #     # If all reward functions return None for a given row, issue a detailed warning
+    #     if torch.isnan(rewards_per_func).all(dim=1).any():
+    #         nan_row_idx = torch.isnan(rewards_per_func).all(dim=1).nonzero(as_tuple=True)[0][0]
+    #         row_reward_kwargs = {key: value[nan_row_idx] for key, value in reward_kwargs.items()}
+    #         row_reward_kwargs["prompt"] = prompts[nan_row_idx]
+    #         row_reward_kwargs["completion"] = completions[nan_row_idx]
+    #         warnings.warn(
+    #             f"All reward functions returned None for the following kwargs: {row_reward_kwargs}. "
+    #             "Please ensure that at least one reward function returns a valid reward."
+    #         )
+
+    #     # Gather the reward per function: this part is crucial, because the rewards are normalized per group and the
+    #     # completions may be distributed across processes
+    #     rewards_per_func = gather(rewards_per_func)
+
+    #     # Apply weights to each reward function's output and sum
+    #     rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).nansum(dim=1)
+
+    #     # Compute grouped-wise rewards
+    #     mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
+    #     std_grouped_rewards = rewards.view(-1, self.num_generations).std(dim=1)
+    #     is_std_zero = torch.isclose(std_grouped_rewards, torch.zeros_like(std_grouped_rewards))
+
+    #     # Normalize the rewards to compute the advantages
+    #     mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
+    #     std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
+    #     advantages = rewards - mean_grouped_rewards
+    #     if self.scale_rewards:
+    #         advantages = advantages / (std_grouped_rewards + 1e-4)
+
+    #     # Slice to keep only the local part of the data
+    #     process_slice = slice(
+    #         self.accelerator.process_index * len(prompts),
+    #         (self.accelerator.process_index + 1) * len(prompts),
+    #     )
+    #     all_process_advantages = advantages.clone()  # keep the aggregated advantages for logging
+    #     advantages = advantages[process_slice]
+
+    #     # Log the metrics
+    #     if mode == "train":
+    #         self.state.num_input_tokens_seen += self.accelerator.gather(attention_mask.sum()).sum().item()
+    #     self._metrics[mode]["num_tokens"] = [self.state.num_input_tokens_seen]
+
+    #     # Log completion lengths, mean, min, max
+    #     agg_completion_lengths = self.accelerator.gather(completion_lengths)
+    #     self._metrics[mode]["completions/mean_length"].append(agg_completion_lengths.float().mean().item())
+    #     self._metrics[mode]["completions/min_length"].append(agg_completion_lengths.float().min().item())
+    #     self._metrics[mode]["completions/max_length"].append(agg_completion_lengths.float().max().item())
+
+    #     # Identify sequences that terminated with EOS and log their lengths
+    #     agg_terminated_with_eos = self.accelerator.gather(is_eos.any(dim=1))
+    #     term_completion_lengths = agg_completion_lengths[agg_terminated_with_eos]
+    #     clipped_completions_ratio = 1 - len(term_completion_lengths) / len(completion_lengths)
+    #     self._metrics[mode]["completions/clipped_ratio"].append(clipped_completions_ratio)
+    #     if len(term_completion_lengths) == 0:  # edge case where no terminated sequences are found
+    #         term_completion_lengths = torch.zeros(1, device=device)
+    #     self._metrics[mode]["completions/mean_terminated_length"].append(term_completion_lengths.float().mean().item())
+    #     self._metrics[mode]["completions/min_terminated_length"].append(term_completion_lengths.float().min().item())
+    #     self._metrics[mode]["completions/max_terminated_length"].append(term_completion_lengths.float().max().item())
+
+    #     # Calculate mean reward per function, but only for samples where the function was applied (non-NaN values)
+    #     for i, reward_func_name in enumerate(self.reward_func_names):
+    #         mean_rewards = torch.nanmean(rewards_per_func[:, i]).item()
+    #         self._metrics[mode][f"rewards/{reward_func_name}/mean"].append(mean_rewards)
+    #         std_rewards = nanstd(rewards_per_func[:, i]).item()
+    #         self._metrics[mode][f"rewards/{reward_func_name}/std"].append(std_rewards)
+    #     self._metrics[mode]["reward"].append(mean_grouped_rewards.mean().item())
+    #     self._metrics[mode]["reward_std"].append(std_grouped_rewards.mean().item())
+    #     self._metrics[mode]["frac_reward_zero_std"].append(is_std_zero.float().mean().item())
+
+    #     # Log prompt and completion texts
+    #     self._textual_logs["prompt"].extend(gather_object(prompts_text))
+    #     self._textual_logs["completion"].extend(gather_object(completions_text))
+    #     for i, name in enumerate(self.reward_func_names):
+    #         self._textual_logs["rewards"][name].extend(rewards_per_func[:, i].tolist())
+    #     self._textual_logs["advantages"].extend(all_process_advantages.tolist())
+
+    #     return {
+    #         "prompt_ids": prompt_ids,
+    #         "prompt_mask": prompt_mask,
+    #         "completion_ids": completion_ids,
+    #         "completion_mask": completion_mask,
+    #         "advantages": advantages,
+    #         "old_per_token_logps": old_per_token_logps,
+    #     }
     def _generate_and_score_completions(
         self, inputs: list[dict[str, Union[torch.Tensor, Any]]]
     ) -> dict[str, Union[torch.Tensor, Any]]:
@@ -1080,9 +1433,6 @@ class GRPOTrainer(Trainer):
             if self.vllm_mode == "server":
                 all_prompts_text = gather_object(prompts_text)
                 if self.accelerator.is_main_process:
-                    # Since 'prompts' contains 'num_generations' duplicates, we first take unique prompts, and generate
-                    # num_generations outputs for each one. This is faster than generating outputs for each duplicate
-                    # prompt individually.
                     ordered_set_of_prompts = all_prompts_text[:: self.num_generations]
                     with profiling_context(self, "vLLM.generate"):
                         completion_ids = self.vllm_client.generate(
@@ -1098,8 +1448,6 @@ class GRPOTrainer(Trainer):
                         )
                 else:
                     completion_ids = [None] * len(all_prompts_text)
-                # Broadcast the completions from the main process to all processes, ensuring each process receives its
-                # corresponding slice.
                 completion_ids = broadcast_object_list(completion_ids, from_process=0)
                 process_slice = slice(
                     self.accelerator.process_index * len(prompts),
@@ -1107,14 +1455,13 @@ class GRPOTrainer(Trainer):
                 )
                 completion_ids = completion_ids[process_slice]
 
-            # Generate completions using colocated vLLM instances: each device holds vLLM copy and work on their own batch of prompts
             elif self.vllm_mode == "colocate":
                 if self.guided_decoding_regex:
                     guided_decoding = GuidedDecodingParams(backend="outlines", regex=self.guided_decoding_regex)
                 else:
                     guided_decoding = None
                 sampling_params = SamplingParams(
-                    n=1,  # vLLM on each GPU generates only 1 in colocate mode
+                    n=1,
                     repetition_penalty=self.repetition_penalty,
                     temperature=self.temperature,
                     top_p=self.top_p,
@@ -1125,8 +1472,6 @@ class GRPOTrainer(Trainer):
                 )
 
                 if self.vllm_tensor_parallel_size > 1:
-                    # Gather prompts from all ranks in the TP group and flatten.
-                    # Each rank starts with its own prompts; after gathering, all ranks see the full group set.
                     orig_size = len(prompts_text)
                     gathered_prompts = [None for _ in range(self.vllm_tensor_parallel_size)]
                     torch.distributed.all_gather_object(gathered_prompts, prompts_text, group=self.tp_group)
@@ -1140,18 +1485,14 @@ class GRPOTrainer(Trainer):
                 completion_ids = [output.token_ids for outputs in all_outputs for output in outputs.outputs]
 
                 if self.vllm_tensor_parallel_size > 1:
-                    # Slice completions for this rank within its TP group.
-                    # Each rank generates all outputs — we keep only our share.
                     local_rank_in_group = torch.distributed.get_rank(group=self.tp_group)
                     tp_slice = slice(local_rank_in_group * orig_size, (local_rank_in_group + 1) * orig_size)
                     completion_ids = completion_ids[tp_slice]
 
-            # Pad the completions, and concatenate them with the prompts
             completion_ids = [torch.tensor(ids, device=device) for ids in completion_ids]
             completion_ids = pad(completion_ids, padding_value=self.processing_class.pad_token_id)
             prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)
         else:
-            # Regular generation path
             with unwrap_model_for_generation(
                 self.model_wrapped, self.accelerator, gather_deepspeed3_params=self.args.ds3_gather_for_generation
             ) as unwrapped_model:
@@ -1164,51 +1505,59 @@ class GRPOTrainer(Trainer):
                         prompt_ids, attention_mask=prompt_mask, generation_config=self.generation_config
                     )
 
-            # Compute prompt length and extract completion ids
             prompt_length = prompt_ids.size(1)
             prompt_ids = prompt_completion_ids[:, :prompt_length]
             completion_ids = prompt_completion_ids[:, prompt_length:]
 
-        # Mask everything after the first EOS token
         is_eos = completion_ids == self.processing_class.eos_token_id
         eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)
         eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
         sequence_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
         completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
 
-        # Convert tensor to a list of lists of token IDs. This will be passed to the reward function, avoiding the need
-        # to re-tokenize completions if the reward is computed from tokens.
         completion_ids_list = [
             [id.item() for id, m in zip(row, mask_row) if m] for row, mask_row in zip(completion_ids, completion_mask)
         ]
 
-        # Sum along sequence dimension (dim=1) to get completion length per sequence, used for logging
         completion_lengths = completion_mask.sum(1)
 
-        # If mask_truncated_completions is enabled, zero out truncated completions in completion_mask
         if self.mask_truncated_completions:
             truncated_completions = ~is_eos.any(dim=1)
             completion_mask = completion_mask * (~truncated_completions).unsqueeze(1).int()
 
-        # Concatenate prompt_mask with completion_mask for logit computation
-        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)  # (B, P+C)
+        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
 
-        logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
+        logits_to_keep = completion_ids.size(1)
         batch_size = self.args.per_device_train_batch_size if mode == "train" else self.args.per_device_eval_batch_size
 
+        # 检查是否有需要熵的奖励函数，并找到其索引
+        entropy_reward_idx = None
+        for idx, rf in enumerate(self.reward_funcs):
+            if isinstance(rf, LogitsBasedReward):
+                entropy_reward_idx = idx
+                break
+        has_entropy_reward = entropy_reward_idx is not None
+        
+        entropy_rewards = None
         with torch.no_grad():
-            # When using num_iterations == 1 and steps_per_generation <= gradient_accumulation_steps
-            # old_per_token_logps == per_token_logps, so we can skip it's computation here, and use
-            # per_token_logps.detach() instead.
             if self.num_iterations > 1 or self.args.steps_per_generation > self.args.gradient_accumulation_steps:
-                old_per_token_logps = self._get_per_token_logps(
-                    self.model, prompt_completion_ids, attention_mask, logits_to_keep, batch_size
-                )
-                # del _
+                if has_entropy_reward:
+                    old_per_token_logps, entropy_rewards = self._get_per_token_logps(
+                        self.model, prompt_completion_ids, attention_mask, logits_to_keep, batch_size,
+                        compute_entropy=True, completion_mask=completion_mask
+                    )
+                else:
+                    old_per_token_logps = self._get_per_token_logps(
+                        self.model, prompt_completion_ids, attention_mask, logits_to_keep, batch_size
+                    )
             else:
                 old_per_token_logps = None
+                if has_entropy_reward:
+                    _, entropy_rewards = self._get_per_token_logps(
+                        self.model, prompt_completion_ids, attention_mask, logits_to_keep, batch_size,
+                        compute_entropy=True, completion_mask=completion_mask
+                    )
 
-        # Decode the generated completions
         completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
         if is_conversational(inputs[0]):
             completions = []
@@ -1220,15 +1569,18 @@ class GRPOTrainer(Trainer):
 
         rewards_per_func = torch.zeros(len(prompts), len(self.reward_funcs), device=device)
 
-        # Repeat all input columns (but "prompt", "completion", and "completion_ids") to match the num of generations
         keys = [key for key in inputs[0] if key not in ["prompt", "completion", "completion_ids"]]
         reward_kwargs = {key: [example[key] for example in inputs] for key in keys}
 
+        # ========== 第一步：计算所有非熵奖励 ==========
         for i, (reward_func, reward_processing_class, reward_func_name) in enumerate(
             zip(self.reward_funcs, self.reward_processing_classes, self.reward_func_names)
         ):
             with profiling_context(self, reward_func_name):
-                if isinstance(reward_func, nn.Module):  # Module (no PretrainedModel) for compat with compiled models
+                if isinstance(reward_func, LogitsBasedReward):
+                    # 熵奖励先跳过，后续计算
+                    continue
+                elif isinstance(reward_func, nn.Module):
                     if is_conversational(inputs[0]):
                         messages = [{"messages": p + c} for p, c in zip(prompts, completions)]
                         texts = [apply_chat_template(x, reward_processing_class)["text"] for x in messages]
@@ -1239,15 +1591,66 @@ class GRPOTrainer(Trainer):
                     )
                     reward_inputs = super()._prepare_inputs(reward_inputs)
                     with torch.inference_mode():
-                        rewards_per_func[:, i] = reward_func(**reward_inputs).logits[:, 0]  # Shape (B*G,)
+                        rewards_per_func[:, i] = reward_func(**reward_inputs).logits[:, 0]
                 else:
                     output_reward_func = reward_func(
                         prompts=prompts, completions=completions, completion_ids=completion_ids_list, **reward_kwargs
                     )
-                    # Convert None values to NaN
                     output_reward_func = [reward if reward is not None else torch.nan for reward in output_reward_func]
-
                     rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
+
+        # ========== 第二步：计算熵奖励（应用系数） ==========
+        # if has_entropy_reward and entropy_rewards is not None:
+        #     # 计算剩余奖励的加权和（不包括熵奖励）
+        #     num_reward_funcs = len(self.reward_func_names)
+            
+        #     # 获取非熵奖励的权重和奖励值
+        #     other_rewards_weighted = torch.zeros(len(prompts), device=device)
+        #     for i in range(num_reward_funcs):
+        #         if i != entropy_reward_idx:
+        #             weight = self.reward_weights[i].to(device)
+        #             reward_val = rewards_per_func[:, i]
+        #             # 处理 NaN：将 NaN 视为 0
+        #             reward_val = torch.where(torch.isnan(reward_val), torch.zeros_like(reward_val), reward_val)
+        #             other_rewards_weighted += weight * reward_val
+            
+        #     # 计算系数: 1.0 * (num_reward_funcs - 1) - other_rewards_weighted
+        #     # 这里 (num_reward_funcs - 1) 是非熵奖励函数的数量
+        #     coefficient = 1.0 * (num_reward_funcs - 1) - other_rewards_weighted
+            
+        #     # 应用系数到熵奖励
+        #     entropy_rewards = entropy_rewards * coefficient
+            
+        #     # 填入熵奖励
+        #     rewards_per_func[:, entropy_reward_idx] = entropy_rewards
+        # ========== 第二步：计算熵奖励（应用系数 + 裁剪） ==========
+        if has_entropy_reward and entropy_rewards is not None:
+            # 找到 accuracy_reward 的索引
+            acc_reward_idx = None
+            for i, name in enumerate(self.reward_func_names):
+                if "accuracy" in name.lower() or "acc" in name.lower():
+                    acc_reward_idx = i
+                    break
+            
+            if acc_reward_idx is not None:
+                acc_rewards = rewards_per_func[:, acc_reward_idx].clone()
+                acc_rewards = torch.where(torch.isnan(acc_rewards), torch.zeros_like(acc_rewards), acc_rewards)
+                acc_rewards = torch.clamp(acc_rewards, 0.0, 1.0)
+                coefficient = 1.0 - acc_rewards
+            else:
+                coefficient = torch.ones(len(prompts), device=device)
+            
+            # 应用系数
+            entropy_rewards = entropy_rewards * coefficient
+            
+            # 裁剪熵奖励
+            entropy_rewards = torch.clamp(
+                entropy_rewards, 
+                self.entropy_clip_min, 
+                self.entropy_clip_max
+            )
+            
+            rewards_per_func[:, entropy_reward_idx] = entropy_rewards
 
         # If all reward functions return None for a given row, issue a detailed warning
         if torch.isnan(rewards_per_func).all(dim=1).any():
@@ -1260,56 +1663,46 @@ class GRPOTrainer(Trainer):
                 "Please ensure that at least one reward function returns a valid reward."
             )
 
-        # Gather the reward per function: this part is crucial, because the rewards are normalized per group and the
-        # completions may be distributed across processes
         rewards_per_func = gather(rewards_per_func)
 
-        # Apply weights to each reward function's output and sum
         rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).nansum(dim=1)
 
-        # Compute grouped-wise rewards
         mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
         std_grouped_rewards = rewards.view(-1, self.num_generations).std(dim=1)
         is_std_zero = torch.isclose(std_grouped_rewards, torch.zeros_like(std_grouped_rewards))
 
-        # Normalize the rewards to compute the advantages
         mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
         std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
         advantages = rewards - mean_grouped_rewards
         if self.scale_rewards:
             advantages = advantages / (std_grouped_rewards + 1e-4)
 
-        # Slice to keep only the local part of the data
         process_slice = slice(
             self.accelerator.process_index * len(prompts),
             (self.accelerator.process_index + 1) * len(prompts),
         )
-        all_process_advantages = advantages.clone()  # keep the aggregated advantages for logging
+        all_process_advantages = advantages.clone()
         advantages = advantages[process_slice]
 
-        # Log the metrics
         if mode == "train":
             self.state.num_input_tokens_seen += self.accelerator.gather(attention_mask.sum()).sum().item()
         self._metrics[mode]["num_tokens"] = [self.state.num_input_tokens_seen]
 
-        # Log completion lengths, mean, min, max
         agg_completion_lengths = self.accelerator.gather(completion_lengths)
         self._metrics[mode]["completions/mean_length"].append(agg_completion_lengths.float().mean().item())
         self._metrics[mode]["completions/min_length"].append(agg_completion_lengths.float().min().item())
         self._metrics[mode]["completions/max_length"].append(agg_completion_lengths.float().max().item())
 
-        # Identify sequences that terminated with EOS and log their lengths
         agg_terminated_with_eos = self.accelerator.gather(is_eos.any(dim=1))
         term_completion_lengths = agg_completion_lengths[agg_terminated_with_eos]
         clipped_completions_ratio = 1 - len(term_completion_lengths) / len(completion_lengths)
         self._metrics[mode]["completions/clipped_ratio"].append(clipped_completions_ratio)
-        if len(term_completion_lengths) == 0:  # edge case where no terminated sequences are found
+        if len(term_completion_lengths) == 0:
             term_completion_lengths = torch.zeros(1, device=device)
         self._metrics[mode]["completions/mean_terminated_length"].append(term_completion_lengths.float().mean().item())
         self._metrics[mode]["completions/min_terminated_length"].append(term_completion_lengths.float().min().item())
         self._metrics[mode]["completions/max_terminated_length"].append(term_completion_lengths.float().max().item())
 
-        # Calculate mean reward per function, but only for samples where the function was applied (non-NaN values)
         for i, reward_func_name in enumerate(self.reward_func_names):
             mean_rewards = torch.nanmean(rewards_per_func[:, i]).item()
             self._metrics[mode][f"rewards/{reward_func_name}/mean"].append(mean_rewards)
@@ -1319,7 +1712,6 @@ class GRPOTrainer(Trainer):
         self._metrics[mode]["reward_std"].append(std_grouped_rewards.mean().item())
         self._metrics[mode]["frac_reward_zero_std"].append(is_std_zero.float().mean().item())
 
-        # Log prompt and completion texts
         self._textual_logs["prompt"].extend(gather_object(prompts_text))
         self._textual_logs["completion"].extend(gather_object(completions_text))
         for i, name in enumerate(self.reward_func_names):
@@ -1349,13 +1741,13 @@ class GRPOTrainer(Trainer):
             with torch.no_grad():
                 if self.ref_model is not None:
                     ref_per_token_logps = self._get_per_token_logps(
-                        self.ref_model, input_ids, attention_mask, logits_to_keep
+                        self.ref_model, input_ids, attention_mask, logits_to_keep, return_logits=False
                     )
                     # del _
                 else:
                     with self.accelerator.unwrap_model(self.model).disable_adapter():
                         ref_per_token_logps = self._get_per_token_logps(
-                            self.model, input_ids, attention_mask, logits_to_keep
+                            self.model, input_ids, attention_mask, logits_to_keep, return_logits=False
                         )
                         # del _
 
@@ -1403,7 +1795,7 @@ class GRPOTrainer(Trainer):
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
         logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
 
-        per_token_logps = self._get_per_token_logps(model, input_ids, attention_mask, logits_to_keep)
+        per_token_logps = self._get_per_token_logps(model, input_ids, attention_mask, logits_to_keep, return_logits=False)
         # per_token_logps, mask = self._get_per_token_logps(model, input_ids, attention_mask, logits_to_keep)
 
         # Compute the KL divergence between the model and the reference model
@@ -1411,13 +1803,13 @@ class GRPOTrainer(Trainer):
             with torch.no_grad():
                 if self.ref_model is not None:
                     ref_per_token_logps = self._get_per_token_logps(
-                        self.ref_model, input_ids, attention_mask, logits_to_keep
+                        self.ref_model, input_ids, attention_mask, logits_to_keep, return_logits=False
                     )
                     # del _
                 else:
                     with self.accelerator.unwrap_model(self.model).disable_adapter():
                         ref_per_token_logps = self._get_per_token_logps(
-                            self.model, input_ids, attention_mask, logits_to_keep
+                            self.model, input_ids, attention_mask, logits_to_keep,return_logits=False
                         )
                         # del _
             per_token_kl = (

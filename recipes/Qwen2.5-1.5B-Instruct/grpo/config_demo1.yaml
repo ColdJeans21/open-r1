@@ -1,59 +1,69 @@
 # Model arguments
 # model_name_or_path: /home/gml/xz/distilgpt2 
 # model_name_or_path: /home/gml/.cache/modelscope/hub/models/Qwen/Qwen2.5-1.5B-Instruct
-model_name_or_path: /home/gml/xz/Qwen3_0.6B-base
+model_name_or_path: /home/gml/xz/Qwen3-0.6B-Math-Expert-idea3/to_1000steps/checkpoint-500
 # model_name_or_path: distilbert/distilgpt2
 model_revision: main
 torch_dtype: bfloat16
 attn_implementation: flash_attention_2
 
 # Data training arguments
-dataset_name: knoveleng/open-rs # open-r1/OpenR1-Math-220k
+# dataset_name: knoveleng/open-rs # open-r1/OpenR1-Math-220k
+dataset_name: openai/gsm8k
+dataset_split: train
+dataset_config: main
 # dataset_name: open-r1/OpenR1-Math-220k
 # dataset_name: /home/gml/xz/dataset/openai_gsm8k
-dataset_prompt_column: problem
+dataset_prompt_column: question
 # system_prompt: "You are a helpful AI Assistant that provides well-reasoned and detailed responses. You first think about the reasoning process as an internal monologue and then provide the user with the answer. Respond in the following format: <think>\n...\n</think>\n<answer>\n...\n</answer>"
 system_prompt: "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant first thinks about the reasoning process in the mind and then provides the user with the answer, and put your final answer within \\boxed{{}} . The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think> <answer> answer here </answer>. Note that respond by English, NOT use other languages."
 # GRPO trainer config
 bf16: true
 use_vllm: true
 do_eval: false
-gradient_accumulation_steps: 8
+gradient_accumulation_steps: 16
 gradient_checkpointing: true
 use_liger_loss: false
 gradient_checkpointing_kwargs:
   use_reentrant: false
 # hub_model_id: Qwen2.5-1.5B-Open-R1-GRPO
 # hub_strategy: every_save
-learning_rate: 2.0e-05
+learning_rate: 1.0e-06
 log_completions: true
 log_level: info
 logging_first_step: true
 logging_steps: 1
 logging_strategy: steps
-lr_scheduler_type: cosine
-max_prompt_length: 512
-max_completion_length: 1024
+lr_scheduler_type: constant
+max_prompt_length: 1024
+max_completion_length: 1300
 max_steps: 500 # -1
-num_generations: 2
-num_train_epochs: 1
-output_dir: /home/gml/xz/Qwen3_0.6B-base-Open-R1-GRPO # data/Qwen2.5-1.5B-Open-R1-GRPO
+num_generations: 4
+num_train_epochs: -1
+output_dir: /home/gml/xz/Qwen3-0.6B-Math-Expert-idea3/to_1500steps_6epoch
 overwrite_output_dir: true
 per_device_eval_batch_size: 1
-per_device_train_batch_size: 2
+per_device_train_batch_size: 4
 push_to_hub: false
-report_to:
-- wandb
+# report_to:
+# - wandb
 reward_funcs:
 - accuracy
-- format
+# - format
 - tag_count
+- entropy_reward
 reward_weights:
 - 1.0
 - 1.0
-- 1.0
+- 0.01
+# 熵参数
+entropy_threshold: 3.948  # 熵阈值
+entropy_clip_min: 0.0   # 熵奖励最小值
+entropy_clip_max: 0.015   # 熵奖励最大值（可调整
 save_strategy: "steps"
 wandb_log_unique_prompts: false
 save_total_limit: 1
 seed: 42
 warmup_ratio: 0.1
+# beta: 0.01
+
