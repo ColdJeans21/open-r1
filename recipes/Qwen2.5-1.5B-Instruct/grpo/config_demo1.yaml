@@ -20,8 +20,10 @@ system_prompt: "A conversation between User and Assistant. The user asks a quest
 # GRPO trainer config
 bf16: true
 use_vllm: true
+# vllm_mode: server
 do_eval: false
-gradient_accumulation_steps: 16
+# eval_dataset: /home/gml/xz/dataset/AIME_24
+gradient_accumulation_steps: 32
 gradient_checkpointing: true
 use_liger_loss: false
 gradient_checkpointing_kwargs:
@@ -40,7 +42,8 @@ max_completion_length: 1300
 max_steps: 500 # -1
 num_generations: 4
 num_train_epochs: -1
-output_dir: /home/gml/xz/Qwen3-0.6B-Math-Expert-idea3/to_1500steps_6epoch
+# output_dir: /home/gml/xz/distilgpt2-Open-R1-GRPO # data/Qwen2.5-1.5B-Open-R1-GRPO /home/gml/xz/Qwen3-0.6B-Math-Expert
+output_dir: /home/gml/xz/Qwen3-0.6B-Math-Expert-idea4
 overwrite_output_dir: true
 per_device_eval_batch_size: 1
 per_device_train_batch_size: 4
@@ -54,16 +57,17 @@ reward_funcs:
 - entropy_reward
 reward_weights:
 - 1.0
+# - 1.0
 - 1.0
-- 0.01
-# 熵参数
-entropy_threshold: 3.948  # 熵阈值
-entropy_clip_min: 0.0   # 熵奖励最小值
-entropy_clip_max: 0.015   # 熵奖励最大值（可调整
 save_strategy: "steps"
 wandb_log_unique_prompts: false
 save_total_limit: 1
 seed: 42
 warmup_ratio: 0.1
-# beta: 0.01
+# Hint-based regeneration
+enable_hint_regeneration: true
+
+hint_truncate_ratio: 0.15          # 截断比例：保留前 15% 的 completion
+hint_regeneration_count: 1         # 每个全零组重新生成的样本数，-1 表示全部重新生成
+hint_template: "\n\nWait, I think I made a mistake. The correct answer should be {answer}. Let me reconsider the problem step by step.\n\n"
 
