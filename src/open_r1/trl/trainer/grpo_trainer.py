@@ -45,6 +45,7 @@ from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
 from transformers.trainer_utils import seed_worker
 from transformers.utils import is_datasets_available, is_peft_available, is_rich_available
 
+from .hint_regeneration import HintRegenerator
 from ..data_utils import apply_chat_template, is_conversational, maybe_apply_chat_template
 from ..extras.profiling import profiling_context, profiling_decorator
 from ..extras.vllm_client import VLLMClient
@@ -610,6 +611,19 @@ class GRPOTrainer(Trainer):
         # it's safer to set it in all cases.
         set_seed(args.seed, device_specific=True)
 
+        self.enable_hint_regeneration = getattr(args, 'enable_hint_regeneration', False)
+        self.hint_regenerator = None
+        if self.enable_hint_regeneration:
+            self.hint_regenerator = HintRegenerator(
+                processing_class=processing_class,
+                generation_config=None,  # Will be set after generation_config is created
+                num_generations=self.num_generations,
+                truncate_ratio=getattr(args, 'hint_truncate_ratio', 0.15),
+                hint_template=getattr(args, 'hint_template',
+                    "\n\nWait, I think I made a mistake. The correct answer should be {answer}. Let me reconsider the problem step by step.\n\n"),
+                regeneration_count=getattr(args, 'hint_regeneration_count', 1),
+            )
+
         if self.use_vllm:
             if not is_vllm_available():
                 raise ImportError(
@@ -680,10 +694,14 @@ class GRPOTrainer(Trainer):
                 repetition_penalty=self.repetition_penalty,
                 cache_implementation=args.cache_implementation,
             )
+            if self.hint_regenerator is not None:
+                self.hint_regenerator.generation_config = self.generation_config
+
 
         # Gradient accumulation requires scaled loss. Normally, loss scaling in the parent class depends on whether the
         # model accepts loss-related kwargs. Since we compute our own loss, this check is irrelevant. We set
         # self.model_accepts_loss_kwargs to False to enable scaling.
+        
         self.model_accepts_loss_kwargs = False
 
         # Add tags to the model
@@ -979,7 +997,418 @@ class GRPOTrainer(Trainer):
             # local generation batch == local eval batch
             inputs = self._generate_and_score_completions(generation_batch)
         return inputs
+    def _apply_hint_regeneration(
+    self,
+    rewards_per_func: torch.Tensor,
+    prompt_ids: torch.Tensor,
+    prompt_mask: torch.Tensor,
+    completion_ids: torch.Tensor,
+    completion_mask: torch.Tensor,
+    completions: list,
+    completion_ids_list: list,
+    prompts: list,
+    reward_kwargs: dict,
+    inputs: list,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list, list]:
+        """
+        Apply hint-based regeneration with memory optimization.
+        
+        Structure after regeneration:
+            Prompt: [Original Prompt] (unchanged, Hint is NOT included in prompt_ids)
+            Completion: [Truncated Part] + [Newly Generated] (both participate in advantage)
+            
+        Note: The Hint is used during generation but is NOT part of the final prompt_ids or completion_ids.
+            This ensures that the advantage is only computed on the actual model outputs.
+        """
+        device = rewards_per_func.device
+        
+        torch.cuda.empty_cache()
+        
+        # Detect all-zero groups
+        all_zero_samples, acc_reward_idx, group_indices = self.hint_regenerator.detect_all_zero_groups(
+            rewards_per_func, self.reward_func_names
+        )
+        
+        if acc_reward_idx is None or not all_zero_samples.any():
+            return rewards_per_func, completion_ids, completion_mask, completions, completion_ids_list
+        
+        # Select samples to regenerate
+        regenerate_indices = self.hint_regenerator.select_samples_to_regenerate(
+            all_zero_samples, group_indices
+        )
+        
+        if len(regenerate_indices) == 0:
+            return rewards_per_func, completion_ids, completion_mask, completions, completion_ids_list
+        
+        # Limit max regeneration count for memory
+        max_regenerate = min(len(regenerate_indices), 4)
+        regenerate_indices = regenerate_indices[:max_regenerate]
+        num_regenerated = len(regenerate_indices)
+        
+        # Get correct answers
+        correct_answers = reward_kwargs.get("answer", reward_kwargs.get("solution", []))
+        correct_answers_expanded = []
+        for idx in regenerate_indices:
+            prompt_idx = idx.item() // self.num_generations
+            if prompt_idx < len(correct_answers):
+                correct_answers_expanded.append(correct_answers[prompt_idx])
+            else:
+                correct_answers_expanded.append("")
+        
+        # Build hint prompts and get truncated completions
+        # New prompt: [Original Prompt] + [Hint]
+        # Truncated completions will be prepended to newly generated
+        padded_prompt_with_hint, padded_prompt_mask_with_hint, hint_lengths, truncated_completions = \
+            self.hint_regenerator.build_hint_prompts_and_get_truncated(
+                prompt_ids=prompt_ids,
+                prompt_mask=prompt_mask,
+                completion_ids=completion_ids,
+                completion_mask=completion_mask,
+                correct_answers=correct_answers_expanded,
+                regenerate_indices=regenerate_indices,
+            )
+        
+        # Calculate reduced max tokens
+        reduced_max_tokens = min(self.max_completion_length, 1100)
+        
+        # Regenerate completions
+        # Result: [Truncated Part] + [Newly Generated]
+        new_completion_ids, new_completion_mask = self.hint_regenerator.regenerate_completions(
+            model=self.model_wrapped,
+            accelerator=self.accelerator,
+            is_fsdp_enabled=self.is_fsdp_enabled,
+            ds3_gather_for_generation=self.args.ds3_gather_for_generation,
+            padded_prompt_ids=padded_prompt_with_hint,
+            padded_prompt_mask=padded_prompt_mask_with_hint,
+            truncated_completions=truncated_completions,
+            max_new_tokens=reduced_max_tokens,
+        )
+        
+        torch.cuda.empty_cache()
+        
+        # Align tensor lengths
+        completion_ids, new_completion_ids = HintRegenerator.align_tensor_lengths(
+            completion_ids, new_completion_ids, self.processing_class.pad_token_id
+        )
+        completion_mask, new_completion_mask = HintRegenerator.align_tensor_lengths(
+            completion_mask, new_completion_mask, 0
+        )
+        
+        # Replace regenerated samples
+        # Note: prompt_ids remains unchanged (original prompt without hint)
+        # completion_ids now contains [Truncated Part] + [Newly Generated]
+        completion_ids[regenerate_indices] = new_completion_ids
+        completion_mask[regenerate_indices] = new_completion_mask
+        
+        # Update completion_ids_list and completions text
+        new_completions_text = self.processing_class.batch_decode(new_completion_ids, skip_special_tokens=True)
+        for i, idx in enumerate(regenerate_indices):
+            idx_val = idx.item()
+            completion_ids_list[idx_val] = [
+                id.item() for id, m in zip(new_completion_ids[i], new_completion_mask[i]) if m
+            ]
+            if is_conversational(inputs[0]):
+                completions[idx_val] = [{"role": "assistant", "content": new_completions_text[i]}]
+            else:
+                completions[idx_val] = new_completions_text[i]
+        
+        # Recalculate rewards for regenerated samples
+        for i, (reward_func, reward_processing_class, reward_func_name) in enumerate(
+            zip(self.reward_funcs, self.reward_processing_classes, self.reward_func_names)
+        ):
+            if isinstance(reward_func, nn.Module):
+                if is_conversational(inputs[0]):
+                    regen_messages = [
+                        {"messages": prompts[idx.item()] + completions[idx.item()]}
+                        for idx in regenerate_indices
+                    ]
+                    regen_texts = [apply_chat_template(x, reward_processing_class)["text"] for x in regen_messages]
+                else:
+                    regen_texts = [
+                        prompts[idx.item()] + completions[idx.item()]
+                        for idx in regenerate_indices
+                    ]
+                reward_inputs = reward_processing_class(
+                    text=regen_texts, return_tensors="pt", padding=True, 
+                    padding_side="right", add_special_tokens=False
+                )
+                reward_inputs = super()._prepare_inputs(reward_inputs)
+                with torch.inference_mode():
+                    new_rewards = reward_func(**reward_inputs).logits[:, 0]
+                for j, idx in enumerate(regenerate_indices):
+                    rewards_per_func[idx, i] = new_rewards[j]
+            else:
+                regenerate_prompts = [prompts[idx.item()] for idx in regenerate_indices]
+                regenerate_completions = [completions[idx.item()] for idx in regenerate_indices]
+                regenerate_completion_ids = [completion_ids_list[idx.item()] for idx in regenerate_indices]
+                regenerate_kwargs = {
+                    key: [reward_kwargs[key][idx.item()] for idx in regenerate_indices]
+                    for key in reward_kwargs
+                }
+                
+                output_reward_func = reward_func(
+                    prompts=regenerate_prompts,
+                    completions=regenerate_completions,
+                    completion_ids=regenerate_completion_ids,
+                    **regenerate_kwargs
+                )
+                output_reward_func = [
+                    reward if reward is not None else torch.nan 
+                    for reward in output_reward_func
+                ]
+                
+                for j, idx in enumerate(regenerate_indices):
+                    rewards_per_func[idx, i] = torch.tensor(
+                        output_reward_func[j], dtype=torch.float32, device=device
+                    )
+        
+        # Log regeneration stats
+        mode = "train" if self.model.training else "eval"
+        self._metrics[mode]["hint_regeneration/count"].append(float(num_regenerated))
+        new_acc_rewards = rewards_per_func[regenerate_indices, acc_reward_idx]
+        success_rate = (new_acc_rewards > 0).float().mean().item()
+        self._metrics[mode]["hint_regeneration/success_rate"].append(success_rate)
+        
+        return rewards_per_func, completion_ids, completion_mask, completions, completion_ids_list
 
+    def _apply_hint_regeneration_vllm(
+    self,
+    rewards_per_func: torch.Tensor,
+    prompt_ids: torch.Tensor,
+    prompt_mask: torch.Tensor,
+    completion_ids: torch.Tensor,
+    completion_mask: torch.Tensor,
+    completions: list,
+    completion_ids_list: list,
+    prompts: list,
+    prompts_text: list[str],
+    reward_kwargs: dict,
+    inputs: list,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list, list]:
+        """
+        Apply hint-based regeneration using vLLM.
+        
+        Structure after regeneration:
+            Prompt: [Original Prompt] (unchanged)
+            Completion: [Truncated Part] + [Newly Generated] (both participate in advantage)
+            
+        The Hint is used during generation but is NOT part of the final completion.
+        """
+        device = rewards_per_func.device
+        
+        # Detect all-zero groups
+        all_zero_samples, acc_reward_idx, group_indices = self.hint_regenerator.detect_all_zero_groups(
+            rewards_per_func, self.reward_func_names
+        )
+        
+        if acc_reward_idx is None or not all_zero_samples.any():
+            return rewards_per_func, completion_ids, completion_mask, completions, completion_ids_list
+        
+        # Select samples to regenerate
+        regenerate_indices = self.hint_regenerator.select_samples_to_regenerate(
+            all_zero_samples, group_indices
+        )
+        
+        if len(regenerate_indices) == 0:
+            return rewards_per_func, completion_ids, completion_mask, completions, completion_ids_list
+        
+        # 限制最大重新生成数量
+        max_regenerate = min(len(regenerate_indices), 4)
+        regenerate_indices = regenerate_indices[:max_regenerate]
+        num_regenerated = len(regenerate_indices)
+        
+        # Get correct answers
+        correct_answers = reward_kwargs.get("answer", reward_kwargs.get("solution", []))
+        correct_answers_expanded = []
+        for idx in regenerate_indices:
+            prompt_idx = idx.item() // self.num_generations
+            if prompt_idx < len(correct_answers):
+                correct_answers_expanded.append(correct_answers[prompt_idx])
+            else:
+                correct_answers_expanded.append("")
+        
+        # Build hint prompts as text (for vLLM) and store truncated completions
+        # Structure: [Original Prompt] + [Hint] -> generate -> [New Part]
+        # Final completion: [Truncated Part] + [New Part]
+        hint_prompts_text = []
+        truncated_completions_text = []  # Store truncated parts to prepend later
+        
+        for i, idx in enumerate(regenerate_indices):
+            idx_val = idx.item()
+            original_prompt = prompts_text[idx_val]
+            original_completion = completions[idx_val]
+            if isinstance(original_completion, list):
+                original_completion = original_completion[0]["content"]
+            
+            # Truncate completion (character-level for text)
+            completion_len = len(original_completion)
+            truncate_pos = max(1, int(completion_len * self.hint_regenerator.truncate_ratio))
+            truncated_completion = original_completion[:truncate_pos]
+            truncated_completions_text.append(truncated_completion)
+            
+            # Build hint
+            answer = correct_answers_expanded[i]
+            answer_value = self.hint_regenerator.extract_answer_value(answer)
+            hint_text = self.hint_regenerator.hint_template.format(answer=answer_value)
+            
+            # New prompt for generation: [Original Prompt] + [Hint]
+            # NOT including truncated_completion in prompt, it will be prepended to the result
+            hint_prompt = original_prompt + hint_text
+            hint_prompts_text.append(hint_prompt)
+        
+        # Generate using vLLM
+        if self.vllm_mode == "server":
+            all_hint_prompts = gather_object(hint_prompts_text)
+            if self.accelerator.is_main_process:
+                with profiling_context(self, "vLLM.hint_regenerate"):
+                    new_generated_ids_list = self.vllm_client.generate(
+                        prompts=all_hint_prompts,
+                        n=1,
+                        repetition_penalty=self.repetition_penalty,
+                        temperature=self.temperature,
+                        top_p=self.top_p,
+                        top_k=-1 if self.top_k is None else self.top_k,
+                        min_p=0.0 if self.min_p is None else self.min_p,
+                        max_tokens=min(self.max_completion_length, 1100),
+                        guided_decoding_regex=self.guided_decoding_regex,
+                    )
+            else:
+                new_generated_ids_list = [None] * len(all_hint_prompts)
+            new_generated_ids_list = broadcast_object_list(new_generated_ids_list, from_process=0)
+            process_slice = slice(
+                self.accelerator.process_index * len(hint_prompts_text),
+                (self.accelerator.process_index + 1) * len(hint_prompts_text),
+            )
+            new_generated_ids_list = new_generated_ids_list[process_slice]
+        
+        elif self.vllm_mode == "colocate":
+            if self.guided_decoding_regex:
+                guided_decoding = GuidedDecodingParams(backend="outlines", regex=self.guided_decoding_regex)
+            else:
+                guided_decoding = None
+            sampling_params = SamplingParams(
+                n=1,
+                repetition_penalty=self.repetition_penalty,
+                temperature=self.temperature,
+                top_p=self.top_p,
+                top_k=-1 if self.top_k is None else self.top_k,
+                min_p=0.0 if self.min_p is None else self.min_p,
+                max_tokens=min(self.max_completion_length, 1100),
+                guided_decoding=guided_decoding,
+            )
+            
+            with profiling_context(self, "vLLM.hint_regenerate"):
+                all_outputs = self.llm.generate(hint_prompts_text, sampling_params=sampling_params, use_tqdm=False)
+            new_generated_ids_list = [output.token_ids for outputs in all_outputs for output in outputs.outputs]
+        
+        # Decode the newly generated parts
+        new_generated_texts = self.processing_class.batch_decode(
+            [torch.tensor(ids) for ids in new_generated_ids_list], 
+            skip_special_tokens=True
+        )
+        
+        # Build final completions: [Truncated Part] + [Newly Generated Part]
+        final_completion_texts = []
+        for truncated, new_gen in zip(truncated_completions_text, new_generated_texts):
+            final_completion_texts.append(truncated + new_gen)
+        
+        # Re-tokenize the final completions to get token ids
+        final_completion_ids_list = []
+        for final_text in final_completion_texts:
+            tokens = self.processing_class.encode(final_text, add_special_tokens=False)
+            final_completion_ids_list.append(tokens)
+        
+        # Convert to tensors and pad
+        final_completion_ids_tensors = [torch.tensor(ids, device=device) for ids in final_completion_ids_list]
+        new_completion_ids_padded = pad(final_completion_ids_tensors, padding_value=self.processing_class.pad_token_id)
+        
+        # Create completion mask
+        is_eos = new_completion_ids_padded == self.processing_class.eos_token_id
+        eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)
+        eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
+        sequence_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
+        new_completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
+        
+        # Align tensor lengths
+        completion_ids, new_completion_ids_padded = HintRegenerator.align_tensor_lengths(
+            completion_ids, new_completion_ids_padded, self.processing_class.pad_token_id
+        )
+        completion_mask, new_completion_mask = HintRegenerator.align_tensor_lengths(
+            completion_mask, new_completion_mask, 0
+        )
+        
+        # Replace regenerated samples
+        completion_ids[regenerate_indices] = new_completion_ids_padded
+        completion_mask[regenerate_indices] = new_completion_mask
+        
+        # Update completion_ids_list and completions text
+        for i, idx in enumerate(regenerate_indices):
+            idx_val = idx.item()
+            completion_ids_list[idx_val] = final_completion_ids_list[i]
+            if is_conversational(inputs[0]):
+                completions[idx_val] = [{"role": "assistant", "content": final_completion_texts[i]}]
+            else:
+                completions[idx_val] = final_completion_texts[i]
+        
+        # Recalculate rewards for regenerated samples
+        for i, (reward_func, reward_processing_class, reward_func_name) in enumerate(
+            zip(self.reward_funcs, self.reward_processing_classes, self.reward_func_names)
+        ):
+            if isinstance(reward_func, nn.Module):
+                if is_conversational(inputs[0]):
+                    regen_messages = [
+                        {"messages": prompts[idx.item()] + completions[idx.item()]}
+                        for idx in regenerate_indices
+                    ]
+                    regen_texts = [apply_chat_template(x, reward_processing_class)["text"] for x in regen_messages]
+                else:
+                    regen_texts = [
+                        prompts[idx.item()] + completions[idx.item()]
+                        for idx in regenerate_indices
+                    ]
+                reward_inputs = reward_processing_class(
+                    text=regen_texts, return_tensors="pt", padding=True,
+                    padding_side="right", add_special_tokens=False
+                )
+                reward_inputs = super()._prepare_inputs(reward_inputs)
+                with torch.inference_mode():
+                    new_rewards = reward_func(**reward_inputs).logits[:, 0]
+                for j, idx in enumerate(regenerate_indices):
+                    rewards_per_func[idx, i] = new_rewards[j]
+            else:
+                regenerate_prompts = [prompts[idx.item()] for idx in regenerate_indices]
+                regenerate_completions = [completions[idx.item()] for idx in regenerate_indices]
+                regenerate_completion_ids = [completion_ids_list[idx.item()] for idx in regenerate_indices]
+                regenerate_kwargs = {
+                    key: [reward_kwargs[key][idx.item()] for idx in regenerate_indices]
+                    for key in reward_kwargs
+                }
+                
+                output_reward_func = reward_func(
+                    prompts=regenerate_prompts,
+                    completions=regenerate_completions,
+                    completion_ids=regenerate_completion_ids,
+                    **regenerate_kwargs
+                )
+                output_reward_func = [
+                    reward if reward is not None else torch.nan
+                    for reward in output_reward_func
+                ]
+                
+                for j, idx in enumerate(regenerate_indices):
+                    rewards_per_func[idx, i] = torch.tensor(
+                        output_reward_func[j], dtype=torch.float32, device=device
+                    )
+        
+        # Log regeneration stats
+        mode = "train" if self.model.training else "eval"
+        self._metrics[mode]["hint_regeneration/count"].append(float(num_regenerated))
+        new_acc_rewards = rewards_per_func[regenerate_indices, acc_reward_idx]
+        success_rate = (new_acc_rewards > 0).float().mean().item()
+        self._metrics[mode]["hint_regeneration/success_rate"].append(success_rate)
+        
+        return rewards_per_func, completion_ids, completion_mask, completions, completion_ids_list
+    
     def _generate_and_score_completions(
         self, inputs: list[dict[str, Union[torch.Tensor, Any]]]
     ) -> dict[str, Union[torch.Tensor, Any]]:
@@ -1176,6 +1605,55 @@ class GRPOTrainer(Trainer):
                     output_reward_func = [reward if reward is not None else torch.nan for reward in output_reward_func]
 
                     rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
+
+        if mode == "train" and self.enable_hint_regeneration:
+            if self.use_vllm:
+        # vLLM 模式下的 hint regeneration
+                rewards_per_func, completion_ids, completion_mask, completions, completion_ids_list = \
+                    self._apply_hint_regeneration_vllm(
+                        rewards_per_func=rewards_per_func,
+                        prompt_ids=prompt_ids,
+                        prompt_mask=prompt_mask,
+                        completion_ids=completion_ids,
+                        completion_mask=completion_mask,
+                        completions=completions,
+                        completion_ids_list=completion_ids_list,
+                        prompts=prompts,
+                        prompts_text=prompts_text,
+                        reward_kwargs=reward_kwargs,
+                        inputs=inputs,
+            )
+            else:
+                # 常规生成模式下的 hint regeneration
+                rewards_per_func, completion_ids, completion_mask, completions, completion_ids_list = \
+                    self._apply_hint_regeneration(
+                        rewards_per_func=rewards_per_func,
+                        prompt_ids=prompt_ids,
+                        prompt_mask=prompt_mask,
+                        completion_ids=completion_ids,
+                        completion_mask=completion_mask,
+                        completions=completions,
+                        completion_ids_list=completion_ids_list,
+                        prompts=prompts,
+                        reward_kwargs=reward_kwargs,
+                        inputs=inputs,
+                    )
+            
+            # Update attention_mask and prompt_completion_ids after regeneration
+            attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
+            prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+            
+            # Update completion_lengths for logging
+            completion_lengths = completion_mask.sum(1)
+            
+            # Recalculate logps if needed
+            logits_to_keep = completion_ids.size(1)
+            with torch.no_grad():
+                if self.num_iterations > 1 or self.args.steps_per_generation > self.args.gradient_accumulation_steps:
+                    old_per_token_logps = self._get_per_token_logps(
+                        self.model, prompt_completion_ids, attention_mask, logits_to_keep, batch_size
+                    )
+
 
         # If all reward functions return None for a given row, issue a detailed warning
         if torch.isnan(rewards_per_func).all(dim=1).any():

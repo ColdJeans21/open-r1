@@ -244,6 +244,22 @@ class GRPOConfig(TrainingArguments):
             "* gradient_accumulation_steps) must be evenly divisible by this value."
         },
     )
+    enable_hint_regeneration: bool = field(
+        default=False,
+        metadata={"help": "Enable hint-based regeneration for all-zero accuracy samples."},
+    )
+    hint_truncate_ratio: float = field(
+        default=0.15,
+        metadata={"help": "Ratio of completion to keep before inserting hint (0.0-1.0)."},
+    )
+    hint_template: str = field(
+        default="\n\nWait, I think I made a mistake. The correct answer should be {answer}. Let me reconsider the problem step by step.\n\n",
+        metadata={"help": "Template for the hint prompt. Use {answer} as placeholder for the correct answer."},
+    )
+    hint_regeneration_count: int = field(
+        default=1,
+        metadata={"help": "Number of samples to regenerate per all-zero group. Set to -1 to regenerate all samples in the group."},
+    )
     max_completion_length: Optional[int] = field(
         default=256,
         metadata={"help": "Maximum length of the generated completion."},
