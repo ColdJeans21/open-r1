@@ -2,7 +2,7 @@
 # model_name_or_path: /home/gml/xz/distilgpt2 
 # model_name_or_path: /home/gml/.cache/modelscope/hub/models/Qwen/Qwen2.5-1.5B-Instruct
 # model_name_or_path: /home/gml/xz/Qwen3_0.6B/home/gml/xz/Qwen3-0.6B-Math-Expert
-model_name_or_path: /home/gml/xz/Qwen3-0.6B-Math-Expert
+model_name_or_path: /gpt/work/Ryan/xz/Qwen3-0.6B-idea4/to_17.2_new/checkpoint-500
 # model_name_or_path: distilbert/distilgpt2
 model_revision: main
 torch_dtype: bfloat16
@@ -20,29 +20,30 @@ system_prompt: "A conversation between User and Assistant. The user asks a quest
 # GRPO trainer config
 bf16: true
 use_vllm: true
+# vllm_mode: server
 do_eval: false
 # eval_dataset: /home/gml/xz/dataset/AIME_24
-gradient_accumulation_steps: 16
+gradient_accumulation_steps: 32
 gradient_checkpointing: true
 use_liger_loss: false
 gradient_checkpointing_kwargs:
   use_reentrant: false
 # hub_model_id: Qwen2.5-1.5B-Open-R1-GRPO
 # hub_strategy: every_save
-learning_rate: 2.0e-05
+learning_rate: 2.0e-06
 log_completions: true
 log_level: info
 logging_first_step: true
 logging_steps: 1
 logging_strategy: steps
-lr_scheduler_type: cosine
+lr_scheduler_type: constant
 max_prompt_length: 1024
 max_completion_length: 1300
 max_steps: 500 # -1
 num_generations: 4
-num_train_epochs: 1
+num_train_epochs: -1
 # output_dir: /home/gml/xz/distilgpt2-Open-R1-GRPO # data/Qwen2.5-1.5B-Open-R1-GRPO /home/gml/xz/Qwen3-0.6B-Math-Expert
-output_dir: /home/gml/xz/Qwen3-0.6B-Math-Expert-I(H>threshold)+grpo+token_level/to_500steps
+output_dir: /gpt/work/Ryan/xz/Qwen3-0.6B-idea4/to_25.8epoch_new
 overwrite_output_dir: true
 per_device_eval_batch_size: 1
 per_device_train_batch_size: 4
@@ -62,4 +63,10 @@ wandb_log_unique_prompts: false
 save_total_limit: 1
 seed: 42
 warmup_ratio: 0.1
+# Hint-based regeneration
+enable_hint_regeneration: true
+
+hint_truncate_ratio: 0.15          # 截断比例：保留前 15% 的 completion
+hint_regeneration_count: 4         # 每个全零组重新生成的样本数，-1 表示全部重新生成
+hint_template: "\n\nWait, I think I made a mistake. Let me reconsider the problem step by step.\n\n"
 
