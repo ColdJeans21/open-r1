@@ -95,3 +95,11 @@ fi
 #     echo "请检查上方日志中的 Python Traceback 错误信息。"
 #     exit 1
 # fi
+
+
+# git checkout -b my-update
+# git add .
+# git commit -m "插入的prompt不参与优势计算（完整版）"
+# git checkout main
+# git merge my-update
+# git push origin main
