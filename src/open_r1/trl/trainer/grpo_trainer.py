@@ -604,6 +604,7 @@ class GRPOTrainer(Trainer):
             "completion": deque(maxlen=maxlen),
             "rewards": defaultdict(lambda: deque(maxlen=maxlen)),
             "advantages": deque(maxlen=maxlen),
+            "is_regenerated": deque(maxlen=maxlen),
         }
 
         # Ensure each process receives a unique seed to prevent duplicate completions when generating with
@@ -1009,7 +1010,7 @@ class GRPOTrainer(Trainer):
     prompts: list,
     reward_kwargs: dict,
     inputs: list,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list, list]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list, list, list[bool]]:
         """
         Apply hint-based regeneration with memory optimization.
         
@@ -1018,11 +1019,16 @@ class GRPOTrainer(Trainer):
             Completion: [Truncated Part] + [Newly Generated] (both participate in advantage)
             
         Note: The Hint is used during generation but is NOT part of the final prompt_ids or completion_ids.
-            This ensures that the advantage is only computed on the actual model outputs.
+            This ensures that the advantage is only computed on the actual model outputs.is_regenerated: list[bool] - 标记每个样本是否被重生成
         """
         device = rewards_per_func.device
-        
+        batch_size = rewards_per_func.size(0)
+    
+        # 初始化重生成标记（全部为 False）
+        is_regenerated = [False] * batch_size
+
         torch.cuda.empty_cache()
+        
         
         # Detect all-zero groups
         all_zero_samples, acc_reward_idx, group_indices = self.hint_regenerator.detect_all_zero_groups(
@@ -1030,7 +1036,7 @@ class GRPOTrainer(Trainer):
         )
         
         if acc_reward_idx is None or not all_zero_samples.any():
-            return rewards_per_func, completion_ids, completion_mask, completions, completion_ids_list
+            return rewards_per_func, completion_ids, completion_mask, completions, completion_ids_list, is_regenerated
         
         # Select samples to regenerate
         regenerate_indices = self.hint_regenerator.select_samples_to_regenerate(
@@ -1038,22 +1044,26 @@ class GRPOTrainer(Trainer):
         )
         
         if len(regenerate_indices) == 0:
-            return rewards_per_func, completion_ids, completion_mask, completions, completion_ids_list
+            return rewards_per_func, completion_ids, completion_mask, completions, completion_ids_list, is_regenerated
         
         # Limit max regeneration count for memory
         max_regenerate = min(len(regenerate_indices), 4)
         regenerate_indices = regenerate_indices[:max_regenerate]
         num_regenerated = len(regenerate_indices)
+
+        # 标记重生成样本
+        for idx in regenerate_indices:
+            is_regenerated[idx.item()] = True
         
         # Get correct answers
-        correct_answers = reward_kwargs.get("answer", reward_kwargs.get("solution", []))
-        correct_answers_expanded = []
-        for idx in regenerate_indices:
-            prompt_idx = idx.item() // self.num_generations
-            if prompt_idx < len(correct_answers):
-                correct_answers_expanded.append(correct_answers[prompt_idx])
-            else:
-                correct_answers_expanded.append("")
+        # correct_answers = reward_kwargs.get("answer", reward_kwargs.get("solution", []))
+        # correct_answers_expanded = []
+        # for idx in regenerate_indices:
+        #     prompt_idx = idx.item() // self.num_generations
+        #     if prompt_idx < len(correct_answers):
+        #         correct_answers_expanded.append(correct_answers[prompt_idx])
+        #     else:
+        #         correct_answers_expanded.append("")
         
         # Build hint prompts and get truncated completions
         # New prompt: [Original Prompt] + [Hint]
@@ -1064,7 +1074,7 @@ class GRPOTrainer(Trainer):
                 prompt_mask=prompt_mask,
                 completion_ids=completion_ids,
                 completion_mask=completion_mask,
-                correct_answers=correct_answers_expanded,
+                # correct_answers=correct_answers_expanded,
                 regenerate_indices=regenerate_indices,
             )
         
@@ -1169,7 +1179,7 @@ class GRPOTrainer(Trainer):
         success_rate = (new_acc_rewards > 0).float().mean().item()
         self._metrics[mode]["hint_regeneration/success_rate"].append(success_rate)
         
-        return rewards_per_func, completion_ids, completion_mask, completions, completion_ids_list
+        return rewards_per_func, completion_ids, completion_mask, completions, completion_ids_list, is_regenerated
 
     def _apply_hint_regeneration_vllm(
     self,
@@ -1195,14 +1205,17 @@ class GRPOTrainer(Trainer):
         The Hint is used during generation but is NOT part of the final completion.
         """
         device = rewards_per_func.device
-        
+        batch_size = rewards_per_func.size(0)
+    
+        # 初始化重生成标记
+        is_regenerated = [False] * batch_size
         # Detect all-zero groups
         all_zero_samples, acc_reward_idx, group_indices = self.hint_regenerator.detect_all_zero_groups(
             rewards_per_func, self.reward_func_names
         )
         
         if acc_reward_idx is None or not all_zero_samples.any():
-            return rewards_per_func, completion_ids, completion_mask, completions, completion_ids_list
+            return rewards_per_func, completion_ids, completion_mask, completions, completion_ids_list, is_regenerated
         
         # Select samples to regenerate
         regenerate_indices = self.hint_regenerator.select_samples_to_regenerate(
@@ -1210,22 +1223,25 @@ class GRPOTrainer(Trainer):
         )
         
         if len(regenerate_indices) == 0:
-            return rewards_per_func, completion_ids, completion_mask, completions, completion_ids_list
+            return rewards_per_func, completion_ids, completion_mask, completions, completion_ids_list, is_regenerated
         
         # 限制最大重新生成数量
         max_regenerate = min(len(regenerate_indices), 4)
         regenerate_indices = regenerate_indices[:max_regenerate]
         num_regenerated = len(regenerate_indices)
         
-        # Get correct answers
-        correct_answers = reward_kwargs.get("answer", reward_kwargs.get("solution", []))
-        correct_answers_expanded = []
+        # 在选择重生成样本后，标记它们
         for idx in regenerate_indices:
-            prompt_idx = idx.item() // self.num_generations
-            if prompt_idx < len(correct_answers):
-                correct_answers_expanded.append(correct_answers[prompt_idx])
-            else:
-                correct_answers_expanded.append("")
+            is_regenerated[idx.item()] = True
+        # Get correct answers
+        # correct_answers = reward_kwargs.get("answer", reward_kwargs.get("solution", []))
+        # correct_answers_expanded = []
+        # for idx in regenerate_indices:
+        #     prompt_idx = idx.item() // self.num_generations
+        #     if prompt_idx < len(correct_answers):
+        #         correct_answers_expanded.append(correct_answers[prompt_idx])
+        #     else:
+        #         correct_answers_expanded.append("")
         
         # Build hint prompts as text (for vLLM) and store truncated completions
         # Structure: [Original Prompt] + [Hint] -> generate -> [New Part]
@@ -1247,9 +1263,10 @@ class GRPOTrainer(Trainer):
             truncated_completions_text.append(truncated_completion)
             
             # Build hint
-            answer = correct_answers_expanded[i]
-            answer_value = self.hint_regenerator.extract_answer_value(answer)
-            hint_text = self.hint_regenerator.hint_template.format(answer=answer_value)
+            # answer = correct_answers_expanded[i]
+            # answer_value = self.hint_regenerator.extract_answer_value(answer)
+            # hint_text = self.hint_regenerator.hint_template.format(answer=answer_value)
+            hint_text = self.hint_regenerator.hint_template
             
             # New prompt for generation: [Original Prompt] + [Hint]
             # NOT including truncated_completion in prompt, it will be prepended to the result
@@ -1407,7 +1424,7 @@ class GRPOTrainer(Trainer):
         success_rate = (new_acc_rewards > 0).float().mean().item()
         self._metrics[mode]["hint_regeneration/success_rate"].append(success_rate)
         
-        return rewards_per_func, completion_ids, completion_mask, completions, completion_ids_list
+        return rewards_per_func, completion_ids, completion_mask, completions, completion_ids_list, is_regenerated
     
     def _generate_and_score_completions(
         self, inputs: list[dict[str, Union[torch.Tensor, Any]]]
@@ -1606,10 +1623,13 @@ class GRPOTrainer(Trainer):
 
                     rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
 
+        is_regenerated = [False] * len(completions)
+        is_regenerated_tensor = torch.tensor(is_regenerated, dtype=torch.bool, device=device)
+
         if mode == "train" and self.enable_hint_regeneration:
             if self.use_vllm:
         # vLLM 模式下的 hint regeneration
-                rewards_per_func, completion_ids, completion_mask, completions, completion_ids_list = \
+                rewards_per_func, completion_ids, completion_mask, completions, completion_ids_list, is_regenerated = \
                     self._apply_hint_regeneration_vllm(
                         rewards_per_func=rewards_per_func,
                         prompt_ids=prompt_ids,
@@ -1625,7 +1645,7 @@ class GRPOTrainer(Trainer):
             )
             else:
                 # 常规生成模式下的 hint regeneration
-                rewards_per_func, completion_ids, completion_mask, completions, completion_ids_list = \
+                rewards_per_func, completion_ids, completion_mask, completions, completion_ids_list, is_regenerated = \
                     self._apply_hint_regeneration(
                         rewards_per_func=rewards_per_func,
                         prompt_ids=prompt_ids,
@@ -1731,6 +1751,10 @@ class GRPOTrainer(Trainer):
         for i, name in enumerate(self.reward_func_names):
             self._textual_logs["rewards"][name].extend(rewards_per_func[:, i].tolist())
         self._textual_logs["advantages"].extend(all_process_advantages.tolist())
+        gathered_is_regenerated = self.accelerator.gather(is_regenerated_tensor)
+        self._textual_logs["is_regenerated"].extend(gathered_is_regenerated.tolist())
+
+        
 
         return {
             "prompt_ids": prompt_ids,
@@ -1739,6 +1763,7 @@ class GRPOTrainer(Trainer):
             "completion_mask": completion_mask,
             "advantages": advantages,
             "old_per_token_logps": old_per_token_logps,
+            "is_regenerated": is_regenerated_tensor,
         }
 
     def compute_liger_loss(self, unwrapped_model, inputs):
@@ -1925,6 +1950,10 @@ class GRPOTrainer(Trainer):
                     "completion": self._textual_logs["completion"],
                     **self._textual_logs["rewards"],
                     "advantage": self._textual_logs["advantages"],
+                    "is_regenerated": [
+                        "✓ Regenerated" if regen else "" 
+                        for regen in self._textual_logs.get("is_regenerated", [False] * len(self._textual_logs["prompt"]))
+                    ],
                 }
                 df = pd.DataFrame(table)
                 if self.wandb_log_unique_prompts:
