@@ -7,7 +7,6 @@
 ACCELERATE_CONFIG="recipes/accelerate_configs/zero3.yaml"  # accelerate 配置文件路径
 GRPO_CONFIG="recipes/Qwen2.5-1.5B-Instruct/grpo/config_demo1.yaml"  # GRPO 配置文件路径
 LOG_LEVEL="info"  # 日志级别（info/warning/error）
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export WANDB_MODE=offline
 export RAY_DISABLE_METRICS_EXPORTER=1
 # ====================================================================

@@ -359,7 +359,14 @@ class GRPOConfig(TrainingArguments):
         default=None,
         metadata={"help": "Regex for vLLM guided decoding. If `None` (default), guided decoding is disabled."},
     )
-
+    entropy_clip_min: float = field(
+    default=0.0,
+    metadata={"help": "Minimum value for entropy reward clipping."},
+)
+    entropy_clip_max: float = field(
+        default=0.5,
+        metadata={"help": "Maximum value for entropy reward clipping."},
+    )
     # Parameters that control the vLLM server (only used when `vllm_mode` is `"server"`)
     vllm_server_host: str = field(
         default="0.0.0.0",

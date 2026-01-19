@@ -62,8 +62,8 @@ from .utils import (
     print_prompt_completions_sample,
     selective_log_softmax,
 )
-
-
+from open_r1.rewards import LogitsBasedReward
+import torch.nn.functional as F
 if is_peft_available():
     from peft import PeftConfig, get_peft_model
 
@@ -496,6 +496,9 @@ class GRPOTrainer(Trainer):
         self.top_p = args.top_p
         self.top_k = args.top_k
         self.min_p = args.min_p
+        # 熵相关参数
+        self.entropy_clip_min = args.entropy_clip_min
+        self.entropy_clip_max = args.entropy_clip_max
         self.repetition_penalty = args.repetition_penalty
         self.use_vllm = args.use_vllm
         self.vllm_mode = args.vllm_mode
@@ -505,7 +508,7 @@ class GRPOTrainer(Trainer):
         self.loss_type = args.loss_type
         self.scale_rewards = args.scale_rewards
         self.mask_truncated_completions = args.mask_truncated_completions
-
+        self.entropy_threshold = args.entropy_threshold
         # Datasets
         self.shuffle_dataset = args.shuffle_dataset
 
@@ -852,410 +855,149 @@ class GRPOTrainer(Trainer):
 
     # Get the per-token log probabilities for the completions for the model and the reference model
     @profiling_decorator
-    def _get_per_token_logps(self, model, input_ids, attention_mask, logits_to_keep, batch_size=None) -> torch.Tensor:
-        batch_size = batch_size or input_ids.size(0)  # Chunk inputs into smaller batches to reduce memory peak
+    # def _get_per_token_logps(
+    #     self, model, input_ids, attention_mask, logits_to_keep, batch_size=None, return_logits=False
+    # ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+    #     batch_size = batch_size or input_ids.size(0)
+    #     all_logps = []
+    #     all_logits = [] if return_logits else None
+        
+    #     for i in range(0, input_ids.size(0), batch_size):
+    #         input_ids_batch = input_ids[i : i + batch_size]
+    #         attention_mask_batch = attention_mask[i : i + batch_size]
+
+    #         logits = model(
+    #             input_ids=input_ids_batch, attention_mask=attention_mask_batch, logits_to_keep=logits_to_keep + 1
+    #         ).logits
+    #         logits = logits[:, :-1, :]
+    #         input_ids_batch = input_ids_batch[:, -logits_to_keep:]
+    #         logits = logits[:, -logits_to_keep:]
+            
+    #         if return_logits:
+    #             all_logits.append(logits.clone())
+            
+    #         logits = logits / self.temperature
+    #         logps = selective_log_softmax(logits, input_ids_batch)
+    #         all_logps.append(logps)
+        
+    #     if return_logits:
+    #         return torch.cat(all_logps, dim=0), torch.cat(all_logits, dim=0)
+    #     return torch.cat(all_logps, dim=0)
+    def _compute_entropy_reward_from_logits(
+        self,
+        logits: torch.Tensor,
+        completion_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        直接从 logits 计算熵奖励（在 batch 循环内调用，节省显存）
+        返回按行归一化后的熵奖励（未乘以系数，系数在后续计算）
+        
+        Args:
+            logits: (batch_size, seq_len, vocab_size)
+            completion_mask: (batch_size, seq_len)
+            
+        Returns:
+            rewards: (batch_size,)
+        """
+        threshold = self.entropy_threshold
+        epsilon = 1e-8
+        
+        # 计算熵（不除以温度，使用原始 logits）
+        probs = F.softmax(logits, dim=-1)
+        log_probs = F.log_softmax(logits, dim=-1)
+        entropy = -torch.sum(probs * log_probs, dim=-1)  # (B, L)
+        
+        # 应用 mask
+        entropy = entropy * completion_mask
+        
+        # 筛选大于阈值的熵
+        threshold_mask = (entropy > threshold) & (completion_mask > 0)
+        
+        # ========== 修改1：按行进行归一化 ==========
+        batch_size = entropy.size(0)
+        normalized_entropy = torch.zeros_like(entropy)
+        
+        for row_idx in range(batch_size):
+            row_mask = threshold_mask[row_idx]  # (L,)
+            row_entropy = entropy[row_idx]  # (L,)
+            
+            selected_values = row_entropy[row_mask]
+            
+            if selected_values.numel() > 1:
+                min_val = selected_values.min()
+                max_val = selected_values.max()
+                if max_val - min_val > epsilon:
+                    # 按行归一化
+                    norm_values = (selected_values - min_val) / (max_val - min_val)
+                    normalized_entropy[row_idx][row_mask] = norm_values
+                else:
+                    normalized_entropy[row_idx][row_mask] = 0.5
+            elif selected_values.numel() == 1:
+                normalized_entropy[row_idx][row_mask] = 1.0
+        
+        # 计算基础奖励（未乘以系数）
+        valid_counts = threshold_mask.sum(dim=-1).clamp(min=1)
+        rewards = normalized_entropy.sum(dim=-1) / valid_counts
+        
+        return rewards
+    
+    
+    def _get_per_token_logps(
+        self, model, input_ids, attention_mask, logits_to_keep, batch_size=None, 
+        return_logits=False, compute_entropy=False, completion_mask=None
+    ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        """
+        计算 per-token log probs，可选同时计算熵奖励（节省显存）
+        
+        Args:
+            return_logits: 是否返回完整 logits（显存消耗大，不推荐）
+            compute_entropy: 是否计算熵奖励（推荐，显存友好）
+            completion_mask: 计算熵时需要的 mask
+        """
+        batch_size = batch_size or input_ids.size(0)
         all_logps = []
+        all_logits = [] if return_logits else None
+        all_entropy_rewards = [] if compute_entropy else None
+        
         for i in range(0, input_ids.size(0), batch_size):
             input_ids_batch = input_ids[i : i + batch_size]
             attention_mask_batch = attention_mask[i : i + batch_size]
 
-            # We add 1 to `logits_to_keep` because the last logits of the sequence is later excluded
             logits = model(
                 input_ids=input_ids_batch, attention_mask=attention_mask_batch, logits_to_keep=logits_to_keep + 1
             ).logits
-            logits = logits[:, :-1, :]  # (B, L-1, V), exclude the last logit: it corresponds to the next token pred
-            input_ids_batch = input_ids_batch[:, -logits_to_keep:]
-            # For transformers<=4.48, logits_to_keep argument isn't supported, so here we drop logits ourselves.
-            # See https://github.com/huggingface/trl/issues/2770
-            logits = logits[:, -logits_to_keep:]
-            # Divide logits by sampling temperature.
-            # See https://huggingface.co/blog/the_n_implementation_details_of_rlhf_with_ppo#policy-training-implementation-details
-            logits = logits / self.temperature
-            logps = selective_log_softmax(logits, input_ids_batch)  # compute logprobs for the input tokens
-            all_logps.append(logps)
-        return torch.cat(all_logps, dim=0)
-    # def _get_per_token_logps(
-    #     self, model, input_ids, attention_mask, logits_to_keep, batch_size=None
-    # ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    #     """
-    #     计算每个 token 的对数概率和熵
-
-    #     返回:
-    #         logps: 每个 token 的对数概率, shape (B, logits_to_keep)
-    #         mask: 每个位置的熵是否大于阈值, shape (B, logits_to_keep)
-    #         masked_entropy: 原始形状 (B, logits_to_keep) 的张量，仅在 mask 为 True 的位置保留熵值，其余位置为 0
-    #     """
-    #     batch_size = batch_size or input_ids.size(0)
-    #     all_logps = []
-    #     all_masks = []
-    #     all_masked_entropy = []  # 新增：存储按 mask 保留熵值的张量
-
-    #     for i in range(0, input_ids.size(0), batch_size):
-    #         input_ids_batch = input_ids[i : i + batch_size]
-    #         attention_mask_batch = attention_mask[i : i + batch_size]
-
-    #         # 获取 logits
-    #         logits = model(
-    #             input_ids=input_ids_batch,
-    #             attention_mask=attention_mask_batch,
-    #             logits_to_keep=logits_to_keep + 1,
-    #         ).logits
-
-    #         logits = logits[:, :-1, :]  # (B, L-1, V)
-    #         input_ids_batch = input_ids_batch[:, -logits_to_keep:]
-    #         logits = logits[:, -logits_to_keep:]
-
-    #         logits = logits / self.temperature  # 应用温度
-
-    #         # 计算对数概率
-    #         logps = selective_log_softmax(logits, input_ids_batch)
-
-    #         # === 计算熵 ===
-    #         probs = torch.softmax(logits, dim=-1)  # (B, L, V)
-    #         log_probs = torch.log_softmax(logits, dim=-1)  # (B, L, V)
-    #         entropy = -torch.sum(probs * log_probs, dim=-1)  # (B, L)
-
-    #         # 创建 mask
-    #         threshold = 0.672  # 3.948
-    #         mask = (entropy > threshold).to(dtype=logps.dtype)  # (B, L)
-
-    #         # 构造 masked_entropy
-    #         masked_entropy = torch.zeros_like(entropy)  # 初始化与 entropy 同形状的张量
-    #         masked_entropy[mask.bool()] = entropy[
-    #             mask.bool()
-    #         ]  # 仅在 mask 为 True 的位置保留熵值，其余填充为 0
-
-    #         # 收集结果
-    #         all_logps.append(logps)
-    #         all_masks.append(mask)
-    #         all_masked_entropy.append(masked_entropy)
-
-    #     # 拼接所有批次的结果
-    #     logps = torch.cat(all_logps, dim=0)
-    #     mask = torch.cat(all_masks, dim=0)
-    #     masked_entropy = torch.cat(all_masked_entropy, dim=0)
-
-    #     return logps, mask, masked_entropy
-    # def _get_per_token_logps(
-    #         self, model, input_ids, attention_mask, logits_to_keep, batch_size=None
-    #     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    #         """
-    #         计算每个 token 的对数概率和熵
-
-    #         返回:
-    #             logps: 每个 token 的对数概率, shape (B, logits_to_keep)
-    #             mask: 每个位置的熵是否大于阈值, shape (B, logits_to_keep)
-    #             masked_entropy: 原始形状 (B, logits_to_keep) 的张量，仅在 mask 为 True 的位置保留熵值，其余位置为 0
-    #         """
-    #         batch_size = batch_size or input_ids.size(0)
-    #         all_logps = []
-    #         all_masks = []
-    #         all_masked_entropy = []  # 新增：存储按 mask 保留熵值的张量
-
-    #         for i in range(0, input_ids.size(0), batch_size):
-    #             input_ids_batch = input_ids[i : i + batch_size]
-    #             attention_mask_batch = attention_mask[i : i + batch_size]
-
-    #             # 获取 logits
-    #             outputs = model(
-    #                 input_ids=input_ids_batch,
-    #                 attention_mask=attention_mask_batch,
-    #                 logits_to_keep=logits_to_keep + 1,
-    #                 # 如果模型支持，可以在这里直接返回 tuple 而不是对象，减少开销
-    #                 use_cache=False, 
-    #                 return_dict=True
-    #             )
-    #             # 拿到 logits 引用
-    #             logits = outputs.logits 
-                
-    #             # 2. 及时切片：如果 logits_to_keep 较小，切片并 clone 可以通过释放原始大张量来大幅省显存
-    #             # 注意：如果 logits_to_keep 很大（接近全长），clone 反而会增加峰值，这里假设是常规用法
-    #             logits = logits[:, :-1, :]
-    #             logits = logits[:, -logits_to_keep:]
-                
-    #             # 显式删除 outputs 对象，断开引用，帮助 Python 回收除了 logits 以外的显存
-    #             del outputs
-
-    #             if self.temperature != 1.0:
-    #                 logits.div_(self.temperature)  # 3. 就地除法，减少临时张量开销
-
-    #             # 计算对数概率
-    #             logps = selective_log_softmax(logits, input_ids_batch[:, -logits_to_keep:])
-
-                
-    #             # === 计算熵 ===
-    #             probs = torch.softmax(logits, dim=-1)  # (B, L, V)
-
-    #             del logits
-
-    #             # log_probs = torch.log_softmax(logits, dim=-1)  # (B, L, V)
-    #             # entropy = -torch.sum(probs * log_probs, dim=-1)  # (B, L)
-    #             entropy = torch.special.entr(probs).sum(dim=-1)
-
-    #             del probs
-    #             # 创建 mask
-    #             threshold = 0.672  # 3.948
-    #             mask = (entropy > threshold).to(dtype=logps.dtype)  # (B, L)
-
-    #             # 构造 masked_entropy
-    #             masked_entropy = torch.zeros_like(entropy)  # 初始化与 entropy 同形状的张量
-    #             masked_entropy[mask.bool()] = entropy[
-    #                 mask.bool()
-    #             ]  # 仅在 mask 为 True 的位置保留熵值，其余填充为 0
-
-    #             # 收集结果
-    #             all_logps.append(logps)
-    #             all_masks.append(mask)
-    #             all_masked_entropy.append(masked_entropy)
-
-    #         # 拼接所有批次的结果
-    #         logps = torch.cat(all_logps, dim=0)
-    #         mask = torch.cat(all_masks, dim=0)
-    #         masked_entropy = torch.cat(all_masked_entropy, dim=0)
-
-    #         return logps, mask, masked_entropy
-    # def _get_per_token_logps_my_method(
-    #     self, model, input_ids, attention_mask, logits_to_keep, per_reward, batch_size=None
-    # ) -> tuple[torch.Tensor, torch.Tensor]:
-    #     """
-    #     计算每个 token 的对数概率，并计算大于阈值的熵的平均值
-
-    #     返回:
-    #         logps: 每个 token 的对数概率, shape (B, logits_to_keep)
-    #         mean_high_entropy: 一个标量张量(Scalar Tensor)，表示所有大于阈值的熵的平均值
-    #     """
-    #     batch_size = batch_size or input_ids.size(0)
-    #     all_logps = []
-    #     all_high_entropies = []  # 新增：用于收集所有大于阈值的熵值
-
-    #     for i in range(0, input_ids.size(0), batch_size):
-    #         input_ids_batch = input_ids[i : i + batch_size]
-    #         attention_mask_batch = attention_mask[i : i + batch_size]
-
-    #         # 获取 logits
-    #         outputs = model(
-    #             input_ids=input_ids_batch,
-    #             attention_mask=attention_mask_batch,
-    #             logits_to_keep=logits_to_keep + 1,
-    #             use_cache=False,
-    #             return_dict=True,
-    #         )
-    #         # 拿到 logits 引用
-    #         logits = outputs.logits
-
-    #         # 及时切片
-    #         logits = logits[:, :-1, :]
-    #         logits = logits[:, -logits_to_keep:]
-
-    #         # 显式删除 outputs 对象
-    #         del outputs
-
-    #         if self.temperature != 1.0:
-    #             logits.div_(self.temperature)
-
-    #         # 计算对数概率
-    #         logps = selective_log_softmax(logits, input_ids_batch[:, -logits_to_keep:])
-
-    #         # === 计算熵 ===
-    #         probs = torch.softmax(logits, dim=-1)  # (B, L, V)
-            
-    #         # 此时不再需要 logits，释放显存
-    #         del logits
-
-    #         # 使用高效算子计算熵
-    #         entropy = torch.special.entr(probs).sum(dim=-1)  # (B, L)
-            
-    #         # 此时不再需要 probs，释放显存
-    #         del probs
-
-    #         # === 筛选大于阈值的熵 ===
-    #         threshold = 0.672
-    #         # 选出当前批次中所有大于阈值的熵值 (结果是一个一维张量)
-    #         high_entropy_values = entropy[entropy > threshold]
-            
-    #         all_logps.append(logps)
-    #         all_high_entropies.append(high_entropy_values)
-
-    #     # 拼接所有批次的结果
-    #     logps = torch.cat(all_logps, dim=0)
-        
-    #     # 拼接所有筛选出的高熵值并计算平均值
-    #     high_entropies_concat = torch.cat(all_high_entropies, dim=0)
-        
-    #     if high_entropies_concat.numel() > 0:
-    #         mean_high_entropy = high_entropies_concat.mean()
-    #     else:
-    #         # 如果没有数据的熵大于阈值，返回 0.0 (保持与 logps 相同的 device)
-    #         mean_high_entropy = torch.tensor(0.0, device=logps.device, dtype=logps.dtype)
-
-    #     return logps, mean_high_entropy
-    # def _get_per_token_logps_my_method(
-    #     self, model, input_ids, attention_mask, logits_to_keep, per_reward, batch_size=None
-    # ) -> tuple[torch.Tensor, torch.Tensor]: 
-    #     """
-    #     计算每个 token 的对数概率，并计算大于阈值的熵的加权平均值
-
-    #     返回: 
-    #         logps: 每个 token 的对数概率, shape (B, logits_to_keep)
-    #         mean_high_entropy:  一个标量张量(Scalar Tensor)，表示加权熵的平均值
-    #     """
-    #     batch_size = batch_size or input_ids.size(0)
-    #     all_logps = []
-    #     all_high_entropies = []  # 用于收集所有大于阈值的熵值
-
-    #     for i in range(0, input_ids.size(0), batch_size):
-    #         input_ids_batch = input_ids[i : i + batch_size]
-    #         attention_mask_batch = attention_mask[i : i + batch_size]
-
-    #         # 获取 logits
-    #         outputs = model(
-    #             input_ids=input_ids_batch,
-    #             attention_mask=attention_mask_batch,
-    #             logits_to_keep=logits_to_keep + 1,
-    #             use_cache=False,
-    #             return_dict=True,
-    #         )
-    #         # 拿到 logits 引用
-    #         logits = outputs.logits
-
-    #         # 及时切片
-    #         logits = logits[: , :-1, :]
-    #         logits = logits[: , -logits_to_keep:]
-
-    #         # 显式删除 outputs 对象
-    #         del outputs
-
-    #         if self.temperature != 1.0:
-    #             logits.div_(self.temperature)
-
-    #         # 计算对数概率
-    #         logps = selective_log_softmax(logits, input_ids_batch[: , -logits_to_keep:])
-
-    #         # === 计算熵 ===
-    #         probs = torch.softmax(logits, dim=-1)  # (B, L, V)
-            
-    #         # 此时不再需要 logits，释放显存
-    #         del logits
-
-    #         # 使用高效算子计算熵
-    #         entropy = torch.special. entr(probs).sum(dim=-1)  # (B, L)
-            
-    #         # 此时不再需要 probs，释放显存
-    #         del probs
-
-    #         # === 筛选大于阈值的熵 ===
-    #         threshold = 0.672
-    #         # 创建掩码，将小于等于阈值的熵值置为0
-    #         entropy_masked = torch.where(entropy > threshold, entropy, torch.zeros_like(entropy))
-            
-    #         all_logps.append(logps)
-    #         all_high_entropies.append(entropy_masked)
-
-    #     # 拼接所有批次的结果
-    #     logps = torch.cat(all_logps, dim=0)  # (B, L)
-        
-    #     # 拼接所有筛选出的高熵值
-    #     high_entropies_concat = torch.cat(all_high_entropies, dim=0)  # (B, L)
-        
-    #     if high_entropies_concat. numel() > 0:
-    #         # 1. 按行求和
-    #         row_sum = high_entropies_concat.sum(dim=-1)  # (B,)
-            
-    #         # 2. 按行乘以 (1.0 * len(self. reward_func_names) - per_reward)
-    #         weight = 1.0 * len(self.reward_func_names) - per_reward  # (B,)
-    #         weighted_row_sum = row_sum * weight  # (B,)
-            
-    #         # 3. 所有求和取平均乘以 0.01
-    #         mean_high_entropy = weighted_row_sum. mean() * 0.01
-    #     else:
-    #         # 如果没有数据，返回 0.0 (保持与 logps 相同的 device)
-    #         mean_high_entropy = torch.tensor(0.0, device=logps. device, dtype=logps.dtype)
-
-    #     return logps, mean_high_entropy
-    def _get_per_token_logps_my_method(
-    self, model, input_ids, attention_mask, logits_to_keep, per_reward, batch_size=None
-) -> tuple[torch.Tensor, torch.Tensor]:  
-    # """
-    # 计算每个 token 的对数概率，并计算大于阈值的熵的加权平均值
-
-    # 返回:  
-    #     logps: 每个 token 的对数概率, shape (B, logits_to_keep)
-    #     mean_high_entropy: 一个标量张量(Scalar Tensor)，表示加权熵的平均值
-    # """
-        batch_size = batch_size or input_ids.size(0)
-        all_logps = []
-        all_high_entropies = []  # 用于收集所有大于阈值的熵值
-
-        for i in range(0, input_ids.size(0), batch_size):
-            input_ids_batch = input_ids[i :  i + batch_size]
-            attention_mask_batch = attention_mask[i :  i + batch_size]
-
-            # 获取 logits
-            outputs = model(
-                input_ids=input_ids_batch,
-                attention_mask=attention_mask_batch,
-                logits_to_keep=logits_to_keep + 1,
-                use_cache=False,
-                return_dict=True,
-            )
-            # 拿到 logits 引用
-            logits = outputs.logits
-
-            # 及时切片
             logits = logits[:, :-1, :]
-            logits = logits[: , -logits_to_keep:]
-
-            # 显式删除 outputs 对象
-            del outputs
-
-            if self.temperature != 1.0:
-                # logits. div_(self.temperature)
-                logits = logits / self.temperature  # 避免就地操作可能带来的问题
-
-            # 计算对数概率
-            logps = selective_log_softmax(logits, input_ids_batch[: , -logits_to_keep:])
-
-            # === 计算熵 ===
-            probs = torch.softmax(logits, dim=-1)  # (B, L, V)
+            input_ids_batch = input_ids_batch[:, -logits_to_keep:]
+            logits = logits[:, -logits_to_keep:]
             
-            # 此时不再需要 logits，释放显存
-            del logits
-
-            # 使用高效算子计算熵
-            entropy = torch.special.entr(probs).sum(dim=-1)  # (B, L)
+            # 如果需要计算熵，在这里直接计算，不保存完整 logits
+            if compute_entropy and completion_mask is not None:
+                completion_mask_batch = completion_mask[i : i + batch_size]
+                entropy_reward = self._compute_entropy_reward_from_logits(
+                    logits, completion_mask_batch
+                )
+                all_entropy_rewards.append(entropy_reward)
             
-            # 此时不再需要 probs，释放显存
-            del probs
-
-            # === 筛选大于阈值的熵 ===
-            threshold = 0.672
-            # 创建掩码，将小于等于阈值的熵值置为0
-            entropy_masked = torch.where(entropy > threshold, entropy, torch.zeros_like(entropy))
+            if return_logits:
+                all_logits.append(logits.clone())
             
+            # 应用温度计算 log probs
+            logits = logits / self.temperature
+            logps = selective_log_softmax(logits, input_ids_batch)
             all_logps.append(logps)
-            all_high_entropies. append(entropy_masked)
-
-        # 拼接所有批次的结果
-        logps = torch.cat(all_logps, dim=0)  # (B, L)
-        
-        # 拼接所有筛选出的高熵值
-        high_entropies_concat = torch.cat(all_high_entropies, dim=0)  # (B, L)
-        
-        if high_entropies_concat.numel() > 0:
-            # 1. 按行求和取平均
-            row_mean = high_entropies_concat.mean(dim=-1)  # (B,)
             
-            # 2. 按行乘以 (1.0 * len(self.reward_func_names) - per_reward)
-            weight = 1.0 * len(self.reward_func_names) - per_reward  # (B,)
-            weighted_row_mean = row_mean * weight  # (B,)
-            
-            # 3. 所有求和取平均乘以 0.01
-            mean_high_entropy = weighted_row_mean. mean() * 0.01
-        else:
-            # 如果没有数据，返回 0.0 (保持与 logps 相同的 device)
-            mean_high_entropy = torch.tensor(0.0, device=logps.device, dtype=logps.dtype)
-
-        return logps, mean_high_entropy
+            # 显式删除 logits 释放显存
+            if not return_logits:
+                del logits
+        
+        result = torch.cat(all_logps, dim=0)
+        
+        if return_logits:
+            return result, torch.cat(all_logits, dim=0)
+        elif compute_entropy:
+            return result, torch.cat(all_entropy_rewards, dim=0)
+        return result
+    
 
     def _sync_fsdp_params_to_vllm(self, module: nn.Module, prefix: str = "", visited=None):
         """Memory-efficient post-order traversal of FSDP modules to extract full parameters and sync with vLLM."""
@@ -1837,9 +1579,6 @@ class GRPOTrainer(Trainer):
             if self.vllm_mode == "server":
                 all_prompts_text = gather_object(prompts_text)
                 if self.accelerator.is_main_process:
-                    # Since 'prompts' contains 'num_generations' duplicates, we first take unique prompts, and generate
-                    # num_generations outputs for each one. This is faster than generating outputs for each duplicate
-                    # prompt individually.
                     ordered_set_of_prompts = all_prompts_text[:: self.num_generations]
                     with profiling_context(self, "vLLM.generate"):
                         completion_ids = self.vllm_client.generate(
@@ -1855,8 +1594,6 @@ class GRPOTrainer(Trainer):
                         )
                 else:
                     completion_ids = [None] * len(all_prompts_text)
-                # Broadcast the completions from the main process to all processes, ensuring each process receives its
-                # corresponding slice.
                 completion_ids = broadcast_object_list(completion_ids, from_process=0)
                 process_slice = slice(
                     self.accelerator.process_index * len(prompts),
@@ -1864,14 +1601,13 @@ class GRPOTrainer(Trainer):
                 )
                 completion_ids = completion_ids[process_slice]
 
-            # Generate completions using colocated vLLM instances: each device holds vLLM copy and work on their own batch of prompts
             elif self.vllm_mode == "colocate":
                 if self.guided_decoding_regex:
                     guided_decoding = GuidedDecodingParams(backend="outlines", regex=self.guided_decoding_regex)
                 else:
                     guided_decoding = None
                 sampling_params = SamplingParams(
-                    n=1,  # vLLM on each GPU generates only 1 in colocate mode
+                    n=1,
                     repetition_penalty=self.repetition_penalty,
                     temperature=self.temperature,
                     top_p=self.top_p,
@@ -1882,8 +1618,6 @@ class GRPOTrainer(Trainer):
                 )
 
                 if self.vllm_tensor_parallel_size > 1:
-                    # Gather prompts from all ranks in the TP group and flatten.
-                    # Each rank starts with its own prompts; after gathering, all ranks see the full group set.
                     orig_size = len(prompts_text)
                     gathered_prompts = [None for _ in range(self.vllm_tensor_parallel_size)]
                     torch.distributed.all_gather_object(gathered_prompts, prompts_text, group=self.tp_group)
@@ -1897,18 +1631,14 @@ class GRPOTrainer(Trainer):
                 completion_ids = [output.token_ids for outputs in all_outputs for output in outputs.outputs]
 
                 if self.vllm_tensor_parallel_size > 1:
-                    # Slice completions for this rank within its TP group.
-                    # Each rank generates all outputs — we keep only our share.
                     local_rank_in_group = torch.distributed.get_rank(group=self.tp_group)
                     tp_slice = slice(local_rank_in_group * orig_size, (local_rank_in_group + 1) * orig_size)
                     completion_ids = completion_ids[tp_slice]
 
-            # Pad the completions, and concatenate them with the prompts
             completion_ids = [torch.tensor(ids, device=device) for ids in completion_ids]
             completion_ids = pad(completion_ids, padding_value=self.processing_class.pad_token_id)
             prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)
         else:
-            # Regular generation path
             with unwrap_model_for_generation(
                 self.model_wrapped, self.accelerator, gather_deepspeed3_params=self.args.ds3_gather_for_generation
             ) as unwrapped_model:
@@ -1921,50 +1651,59 @@ class GRPOTrainer(Trainer):
                         prompt_ids, attention_mask=prompt_mask, generation_config=self.generation_config
                     )
 
-            # Compute prompt length and extract completion ids
             prompt_length = prompt_ids.size(1)
             prompt_ids = prompt_completion_ids[:, :prompt_length]
             completion_ids = prompt_completion_ids[:, prompt_length:]
 
-        # Mask everything after the first EOS token
         is_eos = completion_ids == self.processing_class.eos_token_id
         eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)
         eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
         sequence_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
         completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
 
-        # Convert tensor to a list of lists of token IDs. This will be passed to the reward function, avoiding the need
-        # to re-tokenize completions if the reward is computed from tokens.
         completion_ids_list = [
             [id.item() for id, m in zip(row, mask_row) if m] for row, mask_row in zip(completion_ids, completion_mask)
         ]
 
-        # Sum along sequence dimension (dim=1) to get completion length per sequence, used for logging
         completion_lengths = completion_mask.sum(1)
 
-        # If mask_truncated_completions is enabled, zero out truncated completions in completion_mask
         if self.mask_truncated_completions:
             truncated_completions = ~is_eos.any(dim=1)
             completion_mask = completion_mask * (~truncated_completions).unsqueeze(1).int()
 
-        # Concatenate prompt_mask with completion_mask for logit computation
-        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)  # (B, P+C)
+        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
 
-        logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
+        logits_to_keep = completion_ids.size(1)
         batch_size = self.args.per_device_train_batch_size if mode == "train" else self.args.per_device_eval_batch_size
 
+        # 检查是否有需要熵的奖励函数，并找到其索引
+        entropy_reward_idx = None
+        for idx, rf in enumerate(self.reward_funcs):
+            if isinstance(rf, LogitsBasedReward):
+                entropy_reward_idx = idx
+                break
+        has_entropy_reward = entropy_reward_idx is not None
+        
+        entropy_rewards = None
         with torch.no_grad():
-            # When using num_iterations == 1 and steps_per_generation <= gradient_accumulation_steps
-            # old_per_token_logps == per_token_logps, so we can skip it's computation here, and use
-            # per_token_logps.detach() instead.
             if self.num_iterations > 1 or self.args.steps_per_generation > self.args.gradient_accumulation_steps:
-                old_per_token_logps = self._get_per_token_logps(
-                    self.model, prompt_completion_ids, attention_mask, logits_to_keep, batch_size
-                )
+                if has_entropy_reward:
+                    old_per_token_logps, entropy_rewards = self._get_per_token_logps(
+                        self.model, prompt_completion_ids, attention_mask, logits_to_keep, batch_size,
+                        compute_entropy=True, completion_mask=completion_mask
+                    )
+                else:
+                    old_per_token_logps = self._get_per_token_logps(
+                        self.model, prompt_completion_ids, attention_mask, logits_to_keep, batch_size
+                    )
             else:
                 old_per_token_logps = None
+                if has_entropy_reward:
+                    _, entropy_rewards = self._get_per_token_logps(
+                        self.model, prompt_completion_ids, attention_mask, logits_to_keep, batch_size,
+                        compute_entropy=True, completion_mask=completion_mask
+                    )
 
-        # Decode the generated completions
         completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
         if is_conversational(inputs[0]):
             completions = []
@@ -1976,15 +1715,18 @@ class GRPOTrainer(Trainer):
 
         rewards_per_func = torch.zeros(len(prompts), len(self.reward_funcs), device=device)
 
-        # Repeat all input columns (but "prompt", "completion", and "completion_ids") to match the num of generations
         keys = [key for key in inputs[0] if key not in ["prompt", "completion", "completion_ids"]]
         reward_kwargs = {key: [example[key] for example in inputs] for key in keys}
 
+        # ========== 第一步：计算所有非熵奖励 ==========
         for i, (reward_func, reward_processing_class, reward_func_name) in enumerate(
             zip(self.reward_funcs, self.reward_processing_classes, self.reward_func_names)
         ):
             with profiling_context(self, reward_func_name):
-                if isinstance(reward_func, nn.Module):  # Module (no PretrainedModel) for compat with compiled models
+                if isinstance(reward_func, LogitsBasedReward):
+                    # 熵奖励先跳过，后续计算
+                    continue
+                elif isinstance(reward_func, nn.Module):
                     if is_conversational(inputs[0]):
                         messages = [{"messages": p + c} for p, c in zip(prompts, completions)]
                         texts = [apply_chat_template(x, reward_processing_class)["text"] for x in messages]
@@ -1995,14 +1737,12 @@ class GRPOTrainer(Trainer):
                     )
                     reward_inputs = super()._prepare_inputs(reward_inputs)
                     with torch.inference_mode():
-                        rewards_per_func[:, i] = reward_func(**reward_inputs).logits[:, 0]  # Shape (B*G,)
+                        rewards_per_func[:, i] = reward_func(**reward_inputs).logits[:, 0]
                 else:
                     output_reward_func = reward_func(
                         prompts=prompts, completions=completions, completion_ids=completion_ids_list, **reward_kwargs
                     )
-                    # Convert None values to NaN
                     output_reward_func = [reward if reward is not None else torch.nan for reward in output_reward_func]
-
                     rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
 
         is_regenerated = [False] * len(completions)
@@ -2068,56 +1808,46 @@ class GRPOTrainer(Trainer):
                 "Please ensure that at least one reward function returns a valid reward."
             )
 
-        # Gather the reward per function: this part is crucial, because the rewards are normalized per group and the
-        # completions may be distributed across processes
         rewards_per_func = gather(rewards_per_func)
 
-        # Apply weights to each reward function's output and sum
         rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).nansum(dim=1)
 
-        # Compute grouped-wise rewards
         mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
         std_grouped_rewards = rewards.view(-1, self.num_generations).std(dim=1)
         is_std_zero = torch.isclose(std_grouped_rewards, torch.zeros_like(std_grouped_rewards))
 
-        # Normalize the rewards to compute the advantages
         mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
         std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
         advantages = rewards - mean_grouped_rewards
         if self.scale_rewards:
             advantages = advantages / (std_grouped_rewards + 1e-4)
 
-        # Slice to keep only the local part of the data
         process_slice = slice(
             self.accelerator.process_index * len(prompts),
             (self.accelerator.process_index + 1) * len(prompts),
         )
-        all_process_advantages = advantages.clone()  # keep the aggregated advantages for logging
+        all_process_advantages = advantages.clone()
         advantages = advantages[process_slice]
-        rewards = rewards[process_slice]
-        # Log the metrics
+
         if mode == "train":
             self.state.num_input_tokens_seen += self.accelerator.gather(attention_mask.sum()).sum().item()
         self._metrics[mode]["num_tokens"] = [self.state.num_input_tokens_seen]
 
-        # Log completion lengths, mean, min, max
         agg_completion_lengths = self.accelerator.gather(completion_lengths)
         self._metrics[mode]["completions/mean_length"].append(agg_completion_lengths.float().mean().item())
         self._metrics[mode]["completions/min_length"].append(agg_completion_lengths.float().min().item())
         self._metrics[mode]["completions/max_length"].append(agg_completion_lengths.float().max().item())
 
-        # Identify sequences that terminated with EOS and log their lengths
         agg_terminated_with_eos = self.accelerator.gather(is_eos.any(dim=1))
         term_completion_lengths = agg_completion_lengths[agg_terminated_with_eos]
         clipped_completions_ratio = 1 - len(term_completion_lengths) / len(completion_lengths)
         self._metrics[mode]["completions/clipped_ratio"].append(clipped_completions_ratio)
-        if len(term_completion_lengths) == 0:  # edge case where no terminated sequences are found
+        if len(term_completion_lengths) == 0:
             term_completion_lengths = torch.zeros(1, device=device)
         self._metrics[mode]["completions/mean_terminated_length"].append(term_completion_lengths.float().mean().item())
         self._metrics[mode]["completions/min_terminated_length"].append(term_completion_lengths.float().min().item())
         self._metrics[mode]["completions/max_terminated_length"].append(term_completion_lengths.float().max().item())
 
-        # Calculate mean reward per function, but only for samples where the function was applied (non-NaN values)
         for i, reward_func_name in enumerate(self.reward_func_names):
             mean_rewards = torch.nanmean(rewards_per_func[:, i]).item()
             self._metrics[mode][f"rewards/{reward_func_name}/mean"].append(mean_rewards)
@@ -2126,8 +1856,7 @@ class GRPOTrainer(Trainer):
         self._metrics[mode]["reward"].append(mean_grouped_rewards.mean().item())
         self._metrics[mode]["reward_std"].append(std_grouped_rewards.mean().item())
         self._metrics[mode]["frac_reward_zero_std"].append(is_std_zero.float().mean().item())
-        # print(self._metrics[mode]["reward"])
-        # Log prompt and completion texts
+
         self._textual_logs["prompt"].extend(gather_object(prompts_text))
         self._textual_logs["completion"].extend(gather_object(completions_text))
         for i, name in enumerate(self.reward_func_names):
@@ -2162,19 +1891,13 @@ class GRPOTrainer(Trainer):
         if self.beta != 0.0:
             with torch.no_grad():
                 if self.ref_model is not None:
-                    # ref_per_token_logps = self._get_per_token_logps(
-                    #     self.ref_model, input_ids, attention_mask, logits_to_keep
-                    # )
-                    ref_per_token_logps, *_ = self._get_per_token_logps(
-                        self.ref_model, input_ids, attention_mask, logits_to_keep
+                    ref_per_token_logps = self._get_per_token_logps(
+                        self.ref_model, input_ids, attention_mask, logits_to_keep, return_logits=False
                     )
                 else:
                     with self.accelerator.unwrap_model(self.model).disable_adapter():
-                        # ref_per_token_logps = self._get_per_token_logps(
-                        #     self.model, input_ids, attention_mask, logits_to_keep
-                        # )
-                        ref_per_token_logps, *_ = self._get_per_token_logps(
-                            self.model, input_ids, attention_mask, logits_to_keep
+                        ref_per_token_logps = self._get_per_token_logps(
+                            self.model, input_ids, attention_mask, logits_to_keep, return_logits=False
                         )
 
         # get the last hidden state of the model
@@ -2221,18 +1944,15 @@ class GRPOTrainer(Trainer):
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
         logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
 
-        # per_token_logps = self._get_per_token_logps(model, input_ids, attention_mask, logits_to_keep)
-        
-        per_token_logps, entropy_reward = self._get_per_token_logps_my_method(
-            model, input_ids, attention_mask, logits_to_keep, inputs["per_reward"]
-        )
+        per_token_logps = self._get_per_token_logps(model, input_ids, attention_mask, logits_to_keep, return_logits=False)
+        # per_token_logps, mask = self._get_per_token_logps(model, input_ids, attention_mask, logits_to_keep)
 
         # Compute the KL divergence between the model and the reference model
         if self.beta != 0.0:
             with torch.no_grad():
                 if self.ref_model is not None:
                     ref_per_token_logps = self._get_per_token_logps(
-                        self.ref_model, input_ids, attention_mask, logits_to_keep
+                        self.ref_model, input_ids, attention_mask, logits_to_keep, return_logits=False
                     )
                     # ref_per_token_logps, *_ = self._get_per_token_logps(
                     #     self.ref_model, input_ids, attention_mask, logits_to_keep
@@ -2240,7 +1960,7 @@ class GRPOTrainer(Trainer):
                 else:
                     with self.accelerator.unwrap_model(self.model).disable_adapter():
                         ref_per_token_logps = self._get_per_token_logps(
-                            self.model, input_ids, attention_mask, logits_to_keep
+                            self.model, input_ids, attention_mask, logits_to_keep,return_logits=False
                         )
                         # ref_per_token_logps, *_ = self._get_per_token_logps(
                         #     self.model, input_ids, attention_mask, logits_to_keep

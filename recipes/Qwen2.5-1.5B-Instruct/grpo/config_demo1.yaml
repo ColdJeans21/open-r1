@@ -9,12 +9,13 @@ torch_dtype: bfloat16
 attn_implementation: flash_attention_2
 # resume_from_checkpoint: /home/gml/xz/Qwen3-0.6B-Math-Expert
 # Data training arguments
-dataset_name: openai/gsm8k #allenai/math_qa # knoveleng/open-rs # open-r1/OpenR1-Math-220k
-# dataset_name: /home/gml/xz/dataset/openai_gsm8k # open-r1/OpenR1-Math-220k
-# dataset_prompt_column: Problem, options
-dataset_prompt_column: question
+# dataset_name: knoveleng/open-rs # open-r1/OpenR1-Math-220k
+dataset_name: openai/gsm8k
 dataset_split: train
 dataset_config: main
+# dataset_name: open-r1/OpenR1-Math-220k
+# dataset_name: /home/gml/xz/dataset/openai_gsm8k
+dataset_prompt_column: question
 # system_prompt: "You are a helpful AI Assistant that provides well-reasoned and detailed responses. You first think about the reasoning process as an internal monologue and then provide the user with the answer. Respond in the following format: <think>\n...\n</think>\n<answer>\n...\n</answer>"
 system_prompt: "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant first thinks about the reasoning process in the mind and then provides the user with the answer, and put your final answer within \\boxed{{}} . The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think> <answer> answer here </answer>. Note that respond by English, NOT use other languages."
 # GRPO trainer config
@@ -54,6 +55,7 @@ reward_funcs:
 - accuracy
 # - format
 - tag_count
+- entropy_reward
 reward_weights:
 - 1.0
 # - 1.0
