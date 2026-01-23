@@ -5,7 +5,7 @@
 
 # ===================== 可修改配置（根据需求调整）=====================
 NUM_GPUS=1                          # 使用的GPU数量
-MODEL_PATH="/gpt/work/Ryan/xz/Qwen3-0.6B-idea4/to_25.8epoch_new/checkpoint-500"  # 模型路径
+MODEL_PATH="/home/gml/xz/Qwen3-0.6B-Math-Expert-Open-R1-GRPO-baseline/to_15epoch/checkpoint-3500"  # 模型路径
 MAX_MODEL_LENGTH=8192               # 模型最大序列长度
 MAX_NEW_TOKENS=6192                 # 生成新token的最大数量（需满足：输入长度+6192 ≤8192）
 GPU_MEM_UTIL=0.3                    # GPU显存利用率（避免显存溢出）
