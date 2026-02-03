@@ -244,13 +244,14 @@ class GRPOConfig(TrainingArguments):
             "* gradient_accumulation_steps) must be evenly divisible by this value."
         },
     )
+    
     enable_hint_regeneration: bool = field(
         default=False,
         metadata={"help": "Enable hint-based regeneration for all-zero accuracy samples."},
     )
     hint_truncate_ratio: float = field(
         default=0.15,
-        metadata={"help": "Ratio of completion to keep before inserting hint (0.0-1.0)."},
+        metadata={"help": "Fallback ratio of completion to keep if entropy detection fails or is disabled (0.0-1.0)."},
     )
     hint_template: str = field(
         default="\n\nWait, I think I made a mistake. The correct answer should be {answer}. Let me reconsider the problem step by step.\n\n",
@@ -259,6 +260,24 @@ class GRPOConfig(TrainingArguments):
     hint_regeneration_count: int = field(
         default=1,
         metadata={"help": "Number of samples to regenerate per all-zero group. Set to -1 to regenerate all samples in the group."},
+    )
+    
+    # Entropy-based truncation parameters
+    use_entropy_detection: bool = field(
+        default=True,
+        metadata={"help": "Whether to use entropy-based detection to determine the truncation point. If False, simplified ratio is used."},
+    )
+    entropy_search_start_ratio: float = field(
+        default=0.15,
+        metadata={"help": "Start of the search range (ratio of completion length) for high-entropy tokens."},
+    )
+    entropy_search_end_ratio: float = field(
+        default=0.35,
+        metadata={"help": "End of the search range (ratio of completion length) for high-entropy tokens."},
+    )
+    entropy_threshold: float = field(
+        default=2.0,
+        metadata={"help": "Entropy threshold. Tokens with entropy higher than this value are considered candidates for hint insertion."},
     )
     max_completion_length: Optional[int] = field(
         default=256,

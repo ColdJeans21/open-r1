@@ -63,9 +63,20 @@ save_total_limit: 1
 seed: 42
 warmup_ratio: 0.1
 # Hint-based regeneration
-enable_hint_regeneration: true
-
-hint_truncate_ratio: 0.15          # 截断比例：保留前 15% 的 completion
-hint_regeneration_count: 3         # 每个全零组重新生成的样本数，-1 表示全部重新生成
+# Hint regeneration parameters
+enable_hint_regeneration: True
+hint_truncate_ratio: 0.35  # fallback ratio
 hint_template: "\n\nWait, I think I made a mistake. Let me reconsider the problem step by step.\n\n"
+hint_regeneration_count: 2
+
+# Entropy-based truncation parameters
+use_entropy_detection: True       # 是否启用熵检测
+entropy_search_start_ratio: 0.15 # 搜索区间起点 (15%)
+entropy_search_end_ratio: 0.35   # 搜索区间终点 (35%)
+entropy_threshold: 3.948           # 熵阈值
+# enable_hint_regeneration: true
+
+# hint_truncate_ratio: 0.15          # 截断比例：保留前 15% 的 completion
+# hint_regeneration_count: 3         # 每个全零组重新生成的样本数，-1 表示全部重新生成
+# hint_template: "\n\nWait, I think I made a mistake. Let me reconsider the problem step by step.\n\n"
 
