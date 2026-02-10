@@ -614,30 +614,7 @@ class GRPOTrainer(Trainer):
 
         self.enable_hint_regeneration = getattr(args, 'enable_hint_regeneration', False)
         self.hint_regenerator = None
-        if self.enable_hint_regeneration:
-            # self.hint_regenerator = HintRegenerator(
-            #     processing_class=processing_class,
-            #     generation_config=None,  # Will be set after generation_config is created
-            #     num_generations=self.num_generations,
-            #     truncate_ratio=getattr(args, 'hint_truncate_ratio', 0.15),
-            #     hint_template=getattr(args, 'hint_template',
-            #         "\n\nWait, I think I made a mistake. The correct answer should be {answer}. Let me reconsider the problem step by step.\n\n"),
-            #     regeneration_count=getattr(args, 'hint_regeneration_count', 1),
-            # )
-            self.hint_regenerator = HintRegenerator(
-                processing_class=processing_class,
-                generation_config=None,  # Will be set after generation_config is created
-                num_generations=self.num_generations,
-                truncate_ratio=getattr(args, 'hint_truncate_ratio', 0.15),
-                hint_template=getattr(args, 'hint_template',
-                    "\n\nWait, I think I made a mistake. Let me reconsider the problem step by step.\n\n"),
-                regeneration_count=getattr(args, 'hint_regeneration_count', 1),
-                # 新增参数
-                entropy_search_start_ratio=getattr(args, 'entropy_search_start_ratio', 0.15),
-                entropy_search_end_ratio=getattr(args, 'entropy_search_end_ratio', 0.35),
-                entropy_threshold=getattr(args, 'entropy_threshold', 2.0),
-                use_entropy_detection=getattr(args, 'use_entropy_detection', True),
-            )
+        
 
         if self.use_vllm:
             if not is_vllm_available():
@@ -695,6 +672,19 @@ class GRPOTrainer(Trainer):
             # desynchronization and seems to lead to DeepSpeed hanging during initialization. To prevent this, we
             # synchronize all processes after vLLM has been fully initialized.
             self.accelerator.wait_for_everyone()
+            # 为 vLLM 模式创建一个临时的 generation_config（用于 hint_regenerator）
+            self.generation_config = GenerationConfig(
+                max_new_tokens=self.max_completion_length,
+                do_sample=True,
+                pad_token_id=processing_class.pad_token_id,
+                bos_token_id=processing_class.bos_token_id,
+                eos_token_id=processing_class.eos_token_id,
+                temperature=self.temperature,
+                top_p=self.top_p,
+                top_k=self.top_k,
+                min_p=self.min_p,
+                repetition_penalty=self.repetition_penalty,
+            )
         else:
             self.generation_config = GenerationConfig(
                 max_new_tokens=self.max_completion_length,
@@ -709,8 +699,29 @@ class GRPOTrainer(Trainer):
                 repetition_penalty=self.repetition_penalty,
                 cache_implementation=args.cache_implementation,
             )
-            if self.hint_regenerator is not None:
-                self.hint_regenerator.generation_config = self.generation_config
+
+        if self.enable_hint_regeneration:
+            self.hint_regenerator = HintRegenerator(
+                processing_class=processing_class,
+                generation_config=self.generation_config,
+                num_generations=args.num_generations,
+                truncate_ratio=args.hint_truncate_ratio,
+                hint_template=args.hint_template,
+                regeneration_count=args.hint_regeneration_count,
+                # 熵检测参数
+                entropy_search_start_ratio=args.entropy_search_start_ratio,
+                entropy_search_end_ratio=args.entropy_search_end_ratio,
+                entropy_threshold=args.entropy_threshold,
+                use_entropy_detection=args.use_entropy_detection,
+                # 显存优化参数
+                max_regenerate_samples=args.max_regenerate_samples,
+                entropy_batch_size=args.entropy_batch_size,
+                # 新增：关键词匹配参数
+                use_keyword_matching=getattr(args, 'use_keyword_matching', False),
+                high_entropy_keywords=getattr(args, 'high_entropy_keywords', None),
+            )
+
+        
 
 
         # Gradient accumulation requires scaled loss. Normally, loss scaling in the parent class depends on whether the
@@ -1014,25 +1025,27 @@ class GRPOTrainer(Trainer):
         return inputs
 
 
+    
 
     def _apply_hint_regeneration(
-        self,
-        rewards_per_func: torch.Tensor,
-        prompt_ids: torch.Tensor,
-        prompt_mask: torch.Tensor,
-        completion_ids: torch.Tensor,
-        completion_mask: torch.Tensor,
-        completions: list,
-        completions_text: list,  # 新增：解码后的文本
-        completion_ids_list: list,
-        prompts: list,
-        reward_kwargs: dict,
-        inputs: list,
-        prompt_completion_ids: torch.Tensor,  # 新增：用于计算 logits
-        attention_mask: torch.Tensor,         # 新增：attention mask
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list, list, list[bool]]:
+    self,
+    rewards_per_func: torch.Tensor,
+    prompt_ids: torch.Tensor,
+    prompt_mask: torch.Tensor,
+    completion_ids: torch.Tensor,
+    completion_mask: torch.Tensor,
+    completions: list,
+    completions_text: list,
+    completion_ids_list: list,
+    prompts: list,
+    reward_kwargs: dict,
+    inputs: list,
+    prompt_completion_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list, list, list[bool]]:
         """
         Apply hint-based regeneration with entropy-based truncation.
+        Memory-optimized version with batch processing.
         
         Final structure:
             Prompt: [Original Prompt] (unchanged)
@@ -1042,6 +1055,10 @@ class GRPOTrainer(Trainer):
         batch_size = rewards_per_func.size(0)
         
         is_regenerated = [False] * batch_size
+        
+        # Check if hint regeneration is enabled
+        if self.hint_regenerator is None:
+            return rewards_per_func, completion_ids, completion_mask, completions, completion_ids_list, is_regenerated
         
         torch.cuda.empty_cache()
         
@@ -1053,7 +1070,7 @@ class GRPOTrainer(Trainer):
         if acc_reward_idx is None or not all_zero_samples.any():
             return rewards_per_func, completion_ids, completion_mask, completions, completion_ids_list, is_regenerated
         
-        # Select samples to regenerate
+        # Select samples to regenerate (每组选前 hint_regeneration_count 个)
         regenerate_indices = self.hint_regenerator.select_samples_to_regenerate(
             all_zero_samples, group_indices
         )
@@ -1061,27 +1078,47 @@ class GRPOTrainer(Trainer):
         if len(regenerate_indices) == 0:
             return rewards_per_func, completion_ids, completion_mask, completions, completion_ids_list, is_regenerated
         
+        # 显存优化：限制每批重生成的样本数
+        regenerate_indices = self.hint_regenerator.limit_regenerate_samples(regenerate_indices)
+        
         num_regenerated = len(regenerate_indices)
         
         for idx in regenerate_indices:
             is_regenerated[idx.item()] = True
         
-        # 计算 completion 部分的 logits 用于熵计算
-        completion_logits = None
+        # ============ 显存优化：分批计算熵 ============
+        token_entropies = {}
         if self.hint_regenerator.use_entropy_detection:
+            entropy_batch_size = self.hint_regenerator.entropy_batch_size
+            
             with torch.no_grad():
-                # 只对需要重生成的样本计算 logits
-                regen_prompt_completion_ids = prompt_completion_ids[regenerate_indices]
-                regen_attention_mask = attention_mask[regenerate_indices]
-                
-                # Forward pass to get logits
-                outputs = self.model(
-                    input_ids=regen_prompt_completion_ids,
-                    attention_mask=regen_attention_mask,
-                )
-                # 提取 completion 部分的 logits
-                prompt_length = prompt_ids.size(1)
-                completion_logits = outputs.logits[:, prompt_length-1:-1, :]  # (num_regen, comp_len, vocab)
+                for start_idx in range(0, len(regenerate_indices), entropy_batch_size):
+                    end_idx = min(start_idx + entropy_batch_size, len(regenerate_indices))
+                    batch_indices = regenerate_indices[start_idx:end_idx]
+                    
+                    batch_input_ids = prompt_completion_ids[batch_indices]
+                    batch_attention_mask = attention_mask[batch_indices]
+                    
+                    # Forward pass
+                    outputs = self.model(
+                        input_ids=batch_input_ids,
+                        attention_mask=batch_attention_mask,
+                    )
+                    
+                    # 提取 completion 部分的 logits
+                    prompt_length = prompt_ids.size(1)
+                    batch_completion_logits = outputs.logits[:, prompt_length-1:-1, :]
+                    
+                    # 计算熵
+                    batch_entropy = self.hint_regenerator.compute_token_entropy(batch_completion_logits)
+                    
+                    # 存储到字典
+                    for i, idx in enumerate(batch_indices):
+                        token_entropies[idx.item()] = batch_entropy[i]
+                    
+                    # 立即释放
+                    del outputs, batch_completion_logits, batch_entropy, batch_input_ids, batch_attention_mask
+                    torch.cuda.empty_cache()
         
         # Build generation inputs with entropy-based truncation
         generation_input_ids, generation_attention_mask, truncated_completions, hint_ids_list, truncate_positions = \
@@ -1090,24 +1127,29 @@ class GRPOTrainer(Trainer):
                 prompt_mask=prompt_mask,
                 completion_ids=completion_ids,
                 completion_mask=completion_mask,
-                completion_logits=completion_logits,
+                token_entropies=token_entropies,
                 completions_text=completions_text,
                 regenerate_indices=regenerate_indices,
             )
+        
+        # 释放熵计算结果
+        del token_entropies
+        torch.cuda.empty_cache()
         
         # Log truncate positions
         mode = "train" if self.model.training else "eval"
         if truncate_positions:
             avg_truncate_pos = sum(truncate_positions) / len(truncate_positions)
             self._metrics[mode]["hint_regeneration/avg_truncate_position"].append(avg_truncate_pos)
-            # 计算平均截断比例
             avg_truncate_ratio = sum(
                 pos / completion_mask[regenerate_indices[i]].sum().item() 
                 for i, pos in enumerate(truncate_positions)
             ) / len(truncate_positions)
             self._metrics[mode]["hint_regeneration/avg_truncate_ratio"].append(avg_truncate_ratio)
         
-        reduced_max_tokens = min(self.max_completion_length, 1100)
+        # 生成新的 completion
+        # reduced_max_tokens = min(self.max_completion_length, 800)
+        reduced_max_tokens = self.max_completion_length
         
         new_completion_ids, new_completion_mask = self.hint_regenerator.regenerate_and_build_completion(
             model=self.model_wrapped,
@@ -1121,6 +1163,8 @@ class GRPOTrainer(Trainer):
             max_new_tokens=reduced_max_tokens,
         )
         
+        # 立即释放生成输入
+        del generation_input_ids, generation_attention_mask
         torch.cuda.empty_cache()
         
         completion_ids, new_completion_ids = HintRegenerator.align_tensor_lengths(
@@ -1143,6 +1187,10 @@ class GRPOTrainer(Trainer):
                 completions[idx_val] = [{"role": "assistant", "content": new_completions_text[i]}]
             else:
                 completions[idx_val] = new_completions_text[i]
+        
+        # 释放
+        del new_completion_ids, new_completion_mask
+        torch.cuda.empty_cache()
         
         # Recalculate rewards for regenerated samples
         for i, (reward_func, reward_processing_class, reward_func_name) in enumerate(
@@ -1194,15 +1242,13 @@ class GRPOTrainer(Trainer):
                         output_reward_func[j], dtype=torch.float32, device=device
                     )
         
+        # Log metrics
         self._metrics[mode]["hint_regeneration/count"].append(float(num_regenerated))
         new_acc_rewards = rewards_per_func[regenerate_indices, acc_reward_idx]
         success_rate = (new_acc_rewards > 0).float().mean().item()
         self._metrics[mode]["hint_regeneration/success_rate"].append(success_rate)
         
         return rewards_per_func, completion_ids, completion_mask, completions, completion_ids_list, is_regenerated
-
-
-
 #     def _apply_hint_regeneration_vllm(
 #     self,
 #     rewards_per_func: torch.Tensor,
@@ -1211,29 +1257,28 @@ class GRPOTrainer(Trainer):
 #     completion_ids: torch.Tensor,
 #     completion_mask: torch.Tensor,
 #     completions: list,
+#     completions_text: list,
 #     completion_ids_list: list,
 #     prompts: list,
 #     prompts_text: list[str],
 #     reward_kwargs: dict,
 #     inputs: list,
+#     prompt_completion_ids: torch.Tensor,
+#     attention_mask: torch.Tensor,
 # ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list, list, list[bool]]:
 #         """
-#         Apply hint-based regeneration using vLLM.
-        
-#         Final structure:
-#             Prompt: [Original Prompt] (unchanged)
-#             Completion: [Truncated Part] + [Hint] + [Newly Generated Part]
-            
-#         The Hint is part of the completion and participates in advantage computation,
-#         encouraging the model to learn self-check behavior.
+#         Apply hint-based regeneration using vLLM with entropy-based truncation.
+#         Memory-optimized version.
 #         """
 #         device = rewards_per_func.device
 #         batch_size = rewards_per_func.size(0)
 
-#         # 初始化重生成标记
 #         is_regenerated = [False] * batch_size
         
-#         # Detect all-zero groups
+#         # Check if hint regeneration is enabled
+#         if self.hint_regenerator is None:
+#             return rewards_per_func, completion_ids, completion_mask, completions, completion_ids_list, is_regenerated
+        
 #         all_zero_samples, acc_reward_idx, group_indices = self.hint_regenerator.detect_all_zero_groups(
 #             rewards_per_func, self.reward_func_names
 #         )
@@ -1241,7 +1286,7 @@ class GRPOTrainer(Trainer):
 #         if acc_reward_idx is None or not all_zero_samples.any():
 #             return rewards_per_func, completion_ids, completion_mask, completions, completion_ids_list, is_regenerated
         
-#         # Select samples to regenerate
+#         # Select samples to regenerate (每组选前 hint_regeneration_count 个)
 #         regenerate_indices = self.hint_regenerator.select_samples_to_regenerate(
 #             all_zero_samples, group_indices
 #         )
@@ -1249,39 +1294,101 @@ class GRPOTrainer(Trainer):
 #         if len(regenerate_indices) == 0:
 #             return rewards_per_func, completion_ids, completion_mask, completions, completion_ids_list, is_regenerated
         
-#         # 限制最大重新生成数量
-#         # max_regenerate = min(len(regenerate_indices), 4)
-#         # regenerate_indices = regenerate_indices[:max_regenerate]
+#         # 显存优化：限制每批重生成的样本数
+#         regenerate_indices = self.hint_regenerator.limit_regenerate_samples(regenerate_indices)
+        
 #         num_regenerated = len(regenerate_indices)
         
-#         # 标记重生成样本
 #         for idx in regenerate_indices:
 #             is_regenerated[idx.item()] = True
         
-#         # Build generation prompts and store truncated completions + hint
-#         # Generation input: [Original Prompt] + [Truncated Part] + [Hint]
-#         # Final completion: [Truncated Part] + [Hint] + [Newly Generated]
+#         # ============ 显存优化：分批计算熵 ============
+#         token_entropies = {}
+#         if self.hint_regenerator.use_entropy_detection:
+#             entropy_batch_size = self.hint_regenerator.entropy_batch_size
+            
+#             with torch.no_grad():
+#                 for start_idx in range(0, len(regenerate_indices), entropy_batch_size):
+#                     end_idx = min(start_idx + entropy_batch_size, len(regenerate_indices))
+#                     batch_regen_indices = regenerate_indices[start_idx:end_idx]
+                    
+#                     batch_input_ids = prompt_completion_ids[batch_regen_indices]
+#                     batch_attention_mask = attention_mask[batch_regen_indices]
+                    
+#                     outputs = self.model(
+#                         input_ids=batch_input_ids,
+#                         attention_mask=batch_attention_mask,
+#                     )
+                    
+#                     prompt_length = prompt_ids.size(1)
+#                     completion_logits = outputs.logits[:, prompt_length-1:-1, :]
+#                     batch_entropy = self.hint_regenerator.compute_token_entropy(completion_logits)
+                    
+#                     # 存储到字典
+#                     for i, idx in enumerate(batch_regen_indices):
+#                         token_entropies[idx.item()] = batch_entropy[i]
+                    
+#                     # 立即释放
+#                     del outputs, completion_logits, batch_entropy, batch_input_ids, batch_attention_mask
+#                     torch.cuda.empty_cache()
+        
+#         # Build generation prompts with entropy-based truncation
 #         generation_prompts_text = []
 #         truncated_completions_text = []
-#         hint_text = self.hint_regenerator.hint_template  # 固定的 hint 文本
+#         truncate_positions = []
+#         hint_text = self.hint_regenerator.hint_template
         
 #         for i, idx in enumerate(regenerate_indices):
 #             idx_val = idx.item()
 #             original_prompt = prompts_text[idx_val]
-#             original_completion = completions[idx_val]
+#             original_completion = completions_text[idx_val]
 #             if isinstance(original_completion, list):
-#                 original_completion = original_completion[0]["content"]
+#                 original_completion = original_completion[0]["content"] if original_completion else ""
             
-#             # Truncate completion (character-level for text)
-#             completion_len = len(original_completion)
-#             truncate_pos = max(1, int(completion_len * self.hint_regenerator.truncate_ratio))
-#             truncated_completion = original_completion[:truncate_pos]
-#             truncated_completions_text.append(truncated_completion)
+#             comp_mask = completion_mask[idx_val]
+#             comp_ids = completion_ids[idx_val]
+#             completion_length = int(comp_mask.sum().item())
+            
+#             # Find truncation position using entropy
+#             if self.hint_regenerator.use_entropy_detection and idx_val in token_entropies:
+#                 truncate_pos = self.hint_regenerator.find_high_entropy_position(
+#                     token_entropy=token_entropies[idx_val],
+#                     completion_mask=comp_mask,
+#                     completion_text=original_completion,
+#                     completion_ids=comp_ids,
+#                 )
+#             else:
+#                 truncate_pos = max(1, int(completion_length * self.hint_regenerator.truncate_ratio))
+            
+#             truncate_positions.append(truncate_pos)
+            
+#             # 将 token 位置转换为文本
+#             valid_ids = comp_ids[:completion_length]
+#             truncated_text = self.processing_class.decode(valid_ids[:truncate_pos], skip_special_tokens=True)
+#             truncated_completions_text.append(truncated_text)
             
 #             # Generation prompt: [Original Prompt] + [Truncated Part] + [Hint]
-#             # 注意：这里把 truncated_completion 也加入生成 prompt
-#             generation_prompt = original_prompt + truncated_completion + hint_text
+#             generation_prompt = original_prompt + truncated_text + hint_text
 #             generation_prompts_text.append(generation_prompt)
+        
+#         # 清理熵字典
+#         del token_entropies
+#         torch.cuda.empty_cache()
+        
+#         # Log truncate info
+#         mode = "train" if self.model.training else "eval"
+#         if truncate_positions:
+#             avg_truncate_pos = sum(truncate_positions) / len(truncate_positions)
+#             self._metrics[mode]["hint_regeneration/avg_truncate_position"].append(avg_truncate_pos)
+#             avg_truncate_ratio = sum(
+#                 pos / completion_mask[regenerate_indices[i]].sum().item() 
+#                 for i, pos in enumerate(truncate_positions)
+#             ) / len(truncate_positions)
+#             self._metrics[mode]["hint_regeneration/avg_truncate_ratio"].append(avg_truncate_ratio)
+        
+#         # 显存优化：减少生成长度
+#         # reduced_max_tokens = min(self.max_completion_length, 800)
+#         reduced_max_tokens = self.max_completion_length
         
 #         # Generate using vLLM
 #         if self.vllm_mode == "server":
@@ -1296,7 +1403,7 @@ class GRPOTrainer(Trainer):
 #                         top_p=self.top_p,
 #                         top_k=-1 if self.top_k is None else self.top_k,
 #                         min_p=0.0 if self.min_p is None else self.min_p,
-#                         max_tokens=min(self.max_completion_length, 1100),
+#                         max_tokens=reduced_max_tokens,
 #                         guided_decoding_regex=self.guided_decoding_regex,
 #                     )
 #             else:
@@ -1320,7 +1427,7 @@ class GRPOTrainer(Trainer):
 #                 top_p=self.top_p,
 #                 top_k=-1 if self.top_k is None else self.top_k,
 #                 min_p=0.0 if self.min_p is None else self.min_p,
-#                 max_tokens=min(self.max_completion_length, 1100),
+#                 max_tokens=reduced_max_tokens,
 #                 guided_decoding=guided_decoding,
 #             )
             
@@ -1328,38 +1435,33 @@ class GRPOTrainer(Trainer):
 #                 all_outputs = self.llm.generate(generation_prompts_text, sampling_params=sampling_params, use_tqdm=False)
 #             new_generated_ids_list = [output.token_ids for outputs in all_outputs for output in outputs.outputs]
         
-#         # Decode the newly generated parts
+#         # Decode newly generated parts
 #         new_generated_texts = self.processing_class.batch_decode(
 #             [torch.tensor(ids) for ids in new_generated_ids_list], 
 #             skip_special_tokens=True
 #         )
         
 #         # Build final completions: [Truncated Part] + [Hint] + [Newly Generated Part]
-#         # Hint 现在是 completion 的一部分，参与优势计算
 #         final_completion_texts = []
 #         for truncated, new_gen in zip(truncated_completions_text, new_generated_texts):
-#             # 最终 completion = 截断部分 + Hint + 新生成部分
 #             final_completion = truncated + hint_text + new_gen
 #             final_completion_texts.append(final_completion)
         
-#         # Re-tokenize the final completions to get token ids
+#         # Re-tokenize
 #         final_completion_ids_list = []
 #         for final_text in final_completion_texts:
 #             tokens = self.processing_class.encode(final_text, add_special_tokens=False)
 #             final_completion_ids_list.append(tokens)
         
-#         # Convert to tensors and pad
 #         final_completion_ids_tensors = [torch.tensor(ids, device=device) for ids in final_completion_ids_list]
 #         new_completion_ids_padded = pad(final_completion_ids_tensors, padding_value=self.processing_class.pad_token_id)
         
-#         # Create completion mask
 #         is_eos = new_completion_ids_padded == self.processing_class.eos_token_id
 #         eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)
 #         eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
 #         sequence_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
 #         new_completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
         
-#         # Align tensor lengths
 #         completion_ids, new_completion_ids_padded = HintRegenerator.align_tensor_lengths(
 #             completion_ids, new_completion_ids_padded, self.processing_class.pad_token_id
 #         )
@@ -1367,11 +1469,9 @@ class GRPOTrainer(Trainer):
 #             completion_mask, new_completion_mask, 0
 #         )
         
-#         # Replace regenerated samples
 #         completion_ids[regenerate_indices] = new_completion_ids_padded
 #         completion_mask[regenerate_indices] = new_completion_mask
         
-#         # Update completion_ids_list and completions text
 #         for i, idx in enumerate(regenerate_indices):
 #             idx_val = idx.item()
 #             completion_ids_list[idx_val] = final_completion_ids_list[i]
@@ -1380,7 +1480,11 @@ class GRPOTrainer(Trainer):
 #             else:
 #                 completions[idx_val] = final_completion_texts[i]
         
-#         # Recalculate rewards for regenerated samples
+#         # 清理
+#         del new_completion_ids_padded, new_completion_mask
+#         torch.cuda.empty_cache()
+        
+#         # Recalculate rewards
 #         for i, (reward_func, reward_processing_class, reward_func_name) in enumerate(
 #             zip(self.reward_funcs, self.reward_processing_classes, self.reward_func_names)
 #         ):
@@ -1430,15 +1534,13 @@ class GRPOTrainer(Trainer):
 #                         output_reward_func[j], dtype=torch.float32, device=device
 #                     )
         
-#         # Log regeneration stats
-#         mode = "train" if self.model.training else "eval"
+#         # Log metrics
 #         self._metrics[mode]["hint_regeneration/count"].append(float(num_regenerated))
 #         new_acc_rewards = rewards_per_func[regenerate_indices, acc_reward_idx]
 #         success_rate = (new_acc_rewards > 0).float().mean().item()
 #         self._metrics[mode]["hint_regeneration/success_rate"].append(success_rate)
         
 #         return rewards_per_func, completion_ids, completion_mask, completions, completion_ids_list, is_regenerated
-    
 
     def _apply_hint_regeneration_vllm(
         self,
@@ -1448,124 +1550,158 @@ class GRPOTrainer(Trainer):
         completion_ids: torch.Tensor,
         completion_mask: torch.Tensor,
         completions: list,
-        completions_text: list,  # 解码后的文本
+        completions_text: list,
         completion_ids_list: list,
         prompts: list,
         prompts_text: list[str],
         reward_kwargs: dict,
         inputs: list,
-        prompt_completion_ids: torch.Tensor,  # 新增
-        attention_mask: torch.Tensor,         # 新增
+        prompt_completion_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list, list, list[bool]]:
         """
         Apply hint-based regeneration using vLLM with entropy-based truncation.
+        Memory-optimized version.
         """
         device = rewards_per_func.device
         batch_size = rewards_per_func.size(0)
 
         is_regenerated = [False] * batch_size
         
+        # Check if hint regeneration is enabled
+        if self.hint_regenerator is None:
+            return rewards_per_func, completion_ids, completion_mask, completions, completion_ids_list, is_regenerated
+        
         all_zero_samples, acc_reward_idx, group_indices = self.hint_regenerator.detect_all_zero_groups(
             rewards_per_func, self.reward_func_names
         )
         
-        if acc_reward_idx is None or not all_zero_samples.any():
-            return rewards_per_func, completion_ids, completion_mask, completions, completion_ids_list, is_regenerated
+        # 即使没有需要重生成的样本，也需要参与同步
+        has_samples_to_regenerate = (acc_reward_idx is not None and all_zero_samples.any())
         
-        regenerate_indices = self.hint_regenerator.select_samples_to_regenerate(
-            all_zero_samples, group_indices
-        )
-        
-        if len(regenerate_indices) == 0:
-            return rewards_per_func, completion_ids, completion_mask, completions, completion_ids_list, is_regenerated
+        if has_samples_to_regenerate:
+            # Select samples to regenerate
+            regenerate_indices = self.hint_regenerator.select_samples_to_regenerate(
+                all_zero_samples, group_indices
+            )
+            regenerate_indices = self.hint_regenerator.limit_regenerate_samples(regenerate_indices)
+        else:
+            regenerate_indices = torch.tensor([], dtype=torch.long, device=device)
         
         num_regenerated = len(regenerate_indices)
         
         for idx in regenerate_indices:
             is_regenerated[idx.item()] = True
         
-        # 计算熵（如果启用）
+        # ============ 计算熵（只在有样本时执行）============
         token_entropies = {}
-        if self.hint_regenerator.use_entropy_detection:
+        if num_regenerated > 0 and self.hint_regenerator.use_entropy_detection:
+            entropy_batch_size = self.hint_regenerator.entropy_batch_size
+            
             with torch.no_grad():
-                regen_prompt_completion_ids = prompt_completion_ids[regenerate_indices]
-                regen_attention_mask = attention_mask[regenerate_indices]
-                
-                outputs = self.model(
-                    input_ids=regen_prompt_completion_ids,
-                    attention_mask=regen_attention_mask,
-                )
-                prompt_length = prompt_ids.size(1)
-                completion_logits = outputs.logits[:, prompt_length-1:-1, :]
-                all_entropy = self.hint_regenerator.compute_token_entropy(completion_logits)
-                
-                for i, idx in enumerate(regenerate_indices):
-                    token_entropies[idx.item()] = all_entropy[i]
+                for start_idx in range(0, len(regenerate_indices), entropy_batch_size):
+                    end_idx = min(start_idx + entropy_batch_size, len(regenerate_indices))
+                    batch_regen_indices = regenerate_indices[start_idx:end_idx]
+                    
+                    batch_input_ids = prompt_completion_ids[batch_regen_indices]
+                    batch_attention_mask = attention_mask[batch_regen_indices]
+                    
+                    outputs = self.model(
+                        input_ids=batch_input_ids,
+                        attention_mask=batch_attention_mask,
+                    )
+                    
+                    prompt_length = prompt_ids.size(1)
+                    completion_logits = outputs.logits[:, prompt_length-1:-1, :]
+                    batch_entropy = self.hint_regenerator.compute_token_entropy(completion_logits)
+                    
+                    for i, idx in enumerate(batch_regen_indices):
+                        token_entropies[idx.item()] = batch_entropy[i]
+                    
+                    del outputs, completion_logits, batch_entropy, batch_input_ids, batch_attention_mask
+                    torch.cuda.empty_cache()
         
-        # Build generation prompts with entropy-based truncation
+        # ============ 构建生成 prompt ============
         generation_prompts_text = []
         truncated_completions_text = []
         truncate_positions = []
         hint_text = self.hint_regenerator.hint_template
         
-        for i, idx in enumerate(regenerate_indices):
-            idx_val = idx.item()
-            original_prompt = prompts_text[idx_val]
-            original_completion = completions_text[idx_val]
-            if isinstance(original_completion, list):
-                original_completion = original_completion[0]["content"] if original_completion else ""
-            
-            comp_mask = completion_mask[idx_val]
-            comp_ids = completion_ids[idx_val]
-            completion_length = comp_mask.sum().item()
-            
-            # Find truncation position using entropy
-            if self.hint_regenerator.use_entropy_detection and idx_val in token_entropies:
-                truncate_pos = self.hint_regenerator.find_high_entropy_position(
-                    token_entropy=token_entropies[idx_val],
-                    completion_mask=comp_mask,
-                    completion_text=original_completion,
-                    completion_ids=comp_ids,
-                )
-            else:
-                truncate_pos = max(1, int(completion_length * self.hint_regenerator.truncate_ratio))
-            
-            truncate_positions.append(truncate_pos)
-            
-            # 将 token 位置转换为字符位置
-            valid_ids = comp_ids[:completion_length]
-            truncated_text = self.processing_class.decode(valid_ids[:truncate_pos], skip_special_tokens=True)
-            truncated_completions_text.append(truncated_text)
-            
-            # Generation prompt: [Original Prompt] + [Truncated Part] + [Hint]
-            generation_prompt = original_prompt + truncated_text + hint_text
-            generation_prompts_text.append(generation_prompt)
+        if num_regenerated > 0:
+            for i, idx in enumerate(regenerate_indices):
+                idx_val = idx.item()
+                original_prompt = prompts_text[idx_val]
+                original_completion = completions_text[idx_val]
+                if isinstance(original_completion, list):
+                    original_completion = original_completion[0]["content"] if original_completion else ""
+                
+                comp_mask = completion_mask[idx_val]
+                comp_ids = completion_ids[idx_val]
+                completion_length = int(comp_mask.sum().item())
+                
+                if self.hint_regenerator.use_entropy_detection and idx_val in token_entropies:
+                    truncate_pos = self.hint_regenerator.find_high_entropy_position(
+                        token_entropy=token_entropies[idx_val],
+                        completion_mask=comp_mask,
+                        completion_text=original_completion,
+                        completion_ids=comp_ids,
+                    )
+                else:
+                    truncate_pos = max(1, int(completion_length * self.hint_regenerator.truncate_ratio))
+                
+                truncate_positions.append(truncate_pos)
+                
+                valid_ids = comp_ids[:completion_length]
+                truncated_text = self.processing_class.decode(valid_ids[:truncate_pos], skip_special_tokens=True)
+                truncated_completions_text.append(truncated_text)
+                
+                generation_prompt = original_prompt + truncated_text + hint_text
+                generation_prompts_text.append(generation_prompt)
+        
+        del token_entropies
+        torch.cuda.empty_cache()
         
         # Log truncate info
         mode = "train" if self.model.training else "eval"
         if truncate_positions:
             avg_truncate_pos = sum(truncate_positions) / len(truncate_positions)
             self._metrics[mode]["hint_regeneration/avg_truncate_position"].append(avg_truncate_pos)
+            avg_truncate_ratio = sum(
+                pos / completion_mask[regenerate_indices[i]].sum().item() 
+                for i, pos in enumerate(truncate_positions)
+            ) / len(truncate_positions)
+            self._metrics[mode]["hint_regeneration/avg_truncate_ratio"].append(avg_truncate_ratio)
         
-        # Generate using vLLM
+        # ============ vLLM 生成（关键：所有进程必须参与）============
+        reduced_max_tokens = self.max_completion_length  # 或者用配置参数
+        
         if self.vllm_mode == "server":
+            # 所有进程都必须参与 gather_object，即使 generation_prompts_text 为空
             all_generation_prompts = gather_object(generation_prompts_text)
+            
             if self.accelerator.is_main_process:
-                with profiling_context(self, "vLLM.hint_regenerate"):
-                    new_generated_ids_list = self.vllm_client.generate(
-                        prompts=all_generation_prompts,
-                        n=1,
-                        repetition_penalty=self.repetition_penalty,
-                        temperature=self.temperature,
-                        top_p=self.top_p,
-                        top_k=-1 if self.top_k is None else self.top_k,
-                        min_p=0.0 if self.min_p is None else self.min_p,
-                        max_tokens=min(self.max_completion_length, 1100),
-                        guided_decoding_regex=self.guided_decoding_regex,
-                    )
+                if len(all_generation_prompts) > 0:
+                    with profiling_context(self, "vLLM.hint_regenerate"):
+                        new_generated_ids_list = self.vllm_client.generate(
+                            prompts=all_generation_prompts,
+                            n=1,
+                            repetition_penalty=self.repetition_penalty,
+                            temperature=0.9,
+                            top_p=self.top_p,
+                            top_k=-1 if self.top_k is None else self.top_k,
+                            min_p=0.0 if self.min_p is None else self.min_p,
+                            max_tokens=reduced_max_tokens,
+                            guided_decoding_regex=self.guided_decoding_regex,
+                        )
+                else:
+                    new_generated_ids_list = []
             else:
                 new_generated_ids_list = [None] * len(all_generation_prompts)
+            
+            # 所有进程都必须参与 broadcast
             new_generated_ids_list = broadcast_object_list(new_generated_ids_list, from_process=0)
+            
+            # 获取当前进程的切片
             process_slice = slice(
                 self.accelerator.process_index * len(generation_prompts_text),
                 (self.accelerator.process_index + 1) * len(generation_prompts_text),
@@ -1573,32 +1709,40 @@ class GRPOTrainer(Trainer):
             new_generated_ids_list = new_generated_ids_list[process_slice]
         
         elif self.vllm_mode == "colocate":
-            if self.guided_decoding_regex:
-                guided_decoding = GuidedDecodingParams(backend="outlines", regex=self.guided_decoding_regex)
+            if num_regenerated > 0:
+                if self.guided_decoding_regex:
+                    guided_decoding = GuidedDecodingParams(backend="outlines", regex=self.guided_decoding_regex)
+                else:
+                    guided_decoding = None
+                sampling_params = SamplingParams(
+                    n=1,
+                    repetition_penalty=self.repetition_penalty,
+                    temperature=0.9,
+                    top_p=self.top_p,
+                    top_k=-1 if self.top_k is None else self.top_k,
+                    min_p=0.0 if self.min_p is None else self.min_p,
+                    max_tokens=reduced_max_tokens,
+                    guided_decoding=guided_decoding,
+                )
+                
+                with profiling_context(self, "vLLM.hint_regenerate"):
+                    all_outputs = self.llm.generate(generation_prompts_text, sampling_params=sampling_params, use_tqdm=False)
+                new_generated_ids_list = [output.token_ids for outputs in all_outputs for output in outputs.outputs]
             else:
-                guided_decoding = None
-            sampling_params = SamplingParams(
-                n=1,
-                repetition_penalty=self.repetition_penalty,
-                temperature=self.temperature,
-                top_p=self.top_p,
-                top_k=-1 if self.top_k is None else self.top_k,
-                min_p=0.0 if self.min_p is None else self.min_p,
-                max_tokens=min(self.max_completion_length, 1100),
-                guided_decoding=guided_decoding,
-            )
-            
-            with profiling_context(self, "vLLM.hint_regenerate"):
-                all_outputs = self.llm.generate(generation_prompts_text, sampling_params=sampling_params, use_tqdm=False)
-            new_generated_ids_list = [output.token_ids for outputs in all_outputs for output in outputs.outputs]
+                new_generated_ids_list = []
         
+        # ============ 如果没有重生成样本，直接返回 ============
+        if num_regenerated == 0:
+            return rewards_per_func, completion_ids, completion_mask, completions, completion_ids_list, is_regenerated
+        
+        # ============ 后续处理（只在有样本时执行）============
         # Decode newly generated parts
         new_generated_texts = self.processing_class.batch_decode(
             [torch.tensor(ids) for ids in new_generated_ids_list], 
             skip_special_tokens=True
         )
         
-        # Build final completions: [Truncated Part] + [Hint] + [Newly Generated Part]
+        # Build final completions
         final_completion_texts = []
         for truncated, new_gen in zip(truncated_completions_text, new_generated_texts):
             final_completion = truncated + hint_text + new_gen
@@ -1637,7 +1781,10 @@ class GRPOTrainer(Trainer):
             else:
                 completions[idx_val] = final_completion_texts[i]
         
-        # Recalculate rewards (same as before)
+        del new_completion_ids_padded, new_completion_mask
+        torch.cuda.empty_cache()
+        
+        # Recalculate rewards
         for i, (reward_func, reward_processing_class, reward_func_name) in enumerate(
             zip(self.reward_funcs, self.reward_processing_classes, self.reward_func_names)
         ):
@@ -1687,13 +1834,13 @@ class GRPOTrainer(Trainer):
                         output_reward_func[j], dtype=torch.float32, device=device
                     )
         
+        # Log metrics
         self._metrics[mode]["hint_regeneration/count"].append(float(num_regenerated))
         new_acc_rewards = rewards_per_func[regenerate_indices, acc_reward_idx]
         success_rate = (new_acc_rewards > 0).float().mean().item()
         self._metrics[mode]["hint_regeneration/success_rate"].append(success_rate)
         
         return rewards_per_func, completion_ids, completion_mask, completions, completion_ids_list, is_regenerated
-
 
     def _generate_and_score_completions(
         self, inputs: list[dict[str, Union[torch.Tensor, Any]]]

@@ -245,40 +245,62 @@ class GRPOConfig(TrainingArguments):
         },
     )
     
+    # ...existing code...
+
+    # Hint regeneration parameters
     enable_hint_regeneration: bool = field(
         default=False,
         metadata={"help": "Enable hint-based regeneration for all-zero accuracy samples."},
     )
     hint_truncate_ratio: float = field(
-        default=0.15,
+        default=0.35,
         metadata={"help": "Fallback ratio of completion to keep if entropy detection fails or is disabled (0.0-1.0)."},
     )
     hint_template: str = field(
-        default="\n\nWait, I think I made a mistake. The correct answer should be {answer}. Let me reconsider the problem step by step.\n\n",
-        metadata={"help": "Template for the hint prompt. Use {answer} as placeholder for the correct answer."},
+        default="\n\nWait, I think I made a mistake. Let me reconsider the problem step by step.\n\n",
+        metadata={"help": "Template for the hint prompt."},
     )
     hint_regeneration_count: int = field(
-        default=1,
+        default=2,
         metadata={"help": "Number of samples to regenerate per all-zero group. Set to -1 to regenerate all samples in the group."},
     )
     
     # Entropy-based truncation parameters
     use_entropy_detection: bool = field(
         default=True,
-        metadata={"help": "Whether to use entropy-based detection to determine the truncation point. If False, simplified ratio is used."},
+        metadata={"help": "Use entropy-based detection to find truncation point. If False, use hint_truncate_ratio directly."},
     )
     entropy_search_start_ratio: float = field(
         default=0.15,
-        metadata={"help": "Start of the search range (ratio of completion length) for high-entropy tokens."},
+        metadata={"help": "Start of search range (ratio of completion length) for high-entropy tokens."},
     )
     entropy_search_end_ratio: float = field(
         default=0.35,
-        metadata={"help": "End of the search range (ratio of completion length) for high-entropy tokens."},
+        metadata={"help": "End of search range (ratio of completion length) for high-entropy tokens."},
     )
     entropy_threshold: float = field(
-        default=2.0,
-        metadata={"help": "Entropy threshold. Tokens with entropy higher than this value are considered candidates for hint insertion."},
+        default=3.948,
+        metadata={"help": "Entropy threshold. Tokens with entropy > this value are considered high-entropy."},
     )
+    
+    # Memory optimization parameters for hint regeneration
+    max_regenerate_samples: int = field(
+        default=4,
+        metadata={"help": "Maximum number of samples to regenerate per batch to save memory. Set to -1 for no limit."},
+    )
+    entropy_batch_size: int = field(
+        default=2,
+        metadata={"help": "Batch size for computing entropy to save memory. Smaller values use less memory but are slower."},
+    )
+    use_keyword_matching: bool = field(
+        default=False,
+        metadata={"help": "Use keyword matching to find truncation point. Takes precedence over entropy detection when enabled."},
+    )
+    high_entropy_keywords: str = field(
+        default="therefore,perhaps,maybe,however,but,actually,wait,hmm,let me,I think,alternatively,so,thus,hence,assume,suppose,if,then,first,second,next,finally,step",
+        metadata={"help": "Comma-separated list of keywords that indicate high-entropy points for hint insertion."},
+    )
+# ...existing code...
     max_completion_length: Optional[int] = field(
         default=256,
         metadata={"help": "Maximum length of the generated completion."},

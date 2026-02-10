@@ -4,11 +4,12 @@
 # 运行方式：./run_grpo_training.sh
 
 # ===================== 可修改配置（根据需求调整）=====================
-ACCELERATE_CONFIG="recipes/accelerate_configs/zero3.yaml"  # accelerate 配置文件路径
+ACCELERATE_CONFIG="recipes/accelerate_configs/zero2.yaml"  # accelerate 配置文件路径
 GRPO_CONFIG="recipes/Qwen2.5-1.5B-Instruct/grpo/config_demo1.yaml"  # GRPO 配置文件路径
 LOG_LEVEL="info"  # 日志级别（info/warning/error）
 export WANDB_MODE=offline
 export RAY_DISABLE_METRICS_EXPORTER=1
+export CUDA_VISIBLE_DEVICES=0,1,2,3
 # ====================================================================
 
 # 执行训练命令
