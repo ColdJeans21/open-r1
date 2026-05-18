@@ -1,34 +1,36 @@
 # Model arguments
-# model_name_or_path: /home/gml/xz/distilgpt2 
-# model_name_or_path: /home/gml/.cache/modelscope/hub/models/Qwen/Qwen2.5-1.5B-Instruct
-# model_name_or_path: /home/gml/xz/Qwen3_0.6B/home/gml/xz/Qwen3-0.6B-Math-Expert
-model_name_or_path: /gpt/work/Ryan/xz/Qwen3-1.7B
-# model_name_or_path: distilbert/distilgpt2
+model_name_or_path: /gpt/work/Ryan/xz/Qwen3-8B
 model_revision: main
 torch_dtype: bfloat16
 attn_implementation: flash_attention_2
-vllm_gpu_memory_utilization: 0.3
+
 # Data training arguments
-dataset_name: open-r1/DAPO-Math-17k-Processed #openai/gsm8k # knoveleng/open-rs # open-r1/OpenR1-Math-220k
-# dataset_name: /home/gml/xz/dataset/openai_gsm8k # open-r1/OpenR1-Math-220k
-dataset_prompt_column: prompt #question
+dataset_name: datafreak/Math-level-5  #datafreak/Math-level-5 #open-r1/DAPO-Math-17k-Processed AI-MO/NuminaMath-CoT
+dataset_prompt_column: problem #prompt
 dataset_split: train
-dataset_config: all #main
-# system_prompt: "You are a helpful AI Assistant that provides well-reasoned and detailed responses. You first think about the reasoning process as an internal monologue and then provide the user with the answer. Respond in the following format: <think>\n...\n</think>\n<answer>\n...\n</answer>"
-system_prompt: "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant first thinks about the reasoning process in the mind and then provides the user with the answer, and put your final answer within \boxed{} . The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think> <answer> answer here </answer>."
+# dataset_config: all
+beta: 0.01
+temperature: 0.8
+# System Prompt (关键修正：使用单引号防止 \boxed 被转义)
+system_prompt: 'A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant first thinks about the reasoning process in the mind and then provides the user with the answer, and put your final answer within \boxed{} . The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think> <answer> answer here </answer>.'
+
 # GRPO trainer config
 bf16: true
 use_vllm: true
-# vllm_mode: server
+# vllm_mode: server # 注意：如果你的脚本需要 colocate，请在命令行参数里保留 --vllm_mode colocate
+
+# 关键修正：调大 VLLM 显存比例，防止 8192 长度 OOM
+# 建议：1.7B 模型本身很小，给 VLLM 60%-70% 显存是安全的
+vllm_gpu_memory_utilization: 0.55
+
 do_eval: false
-# eval_dataset: /home/gml/xz/dataset/AIME_24
-gradient_accumulation_steps: 4
+gradient_accumulation_steps: 8
 gradient_checkpointing: true
 use_liger_loss: true
 gradient_checkpointing_kwargs:
   use_reentrant: false
-# hub_model_id: Qwen2.5-1.5B-Open-R1-GRPO
-# hub_strategy: every_save
+vllm_max_model_len: 12224
+# learning_rate: 5.0e-06
 learning_rate: 2.0e-06
 log_completions: true
 log_level: info
@@ -37,71 +39,155 @@ logging_steps: 1
 logging_strategy: steps
 lr_scheduler_type: cosine
 max_prompt_length: 1024
-max_completion_length: 4096
-max_steps: 400 # -1
-num_generations: 8
+max_completion_length: 11200
+max_steps: 350
+num_generations: 4
 num_train_epochs: -1
-# output_dir: /home/gml/xz/distilgpt2-Open-R1-GRPO # data/Qwen2.5-1.5B-Open-R1-GRPO /home/gml/xz/Qwen3-0.6B-Math-Expert
-output_dir: /gpt/work/Ryan/xz/Qwen3-1.7B-idea4/rule_truc_to_600steps/checkpoint_600_4096maxlength
+output_dir: /gpt/work/Ryan/xz/Qwen3-8B/to_350steps_idea4
 overwrite_output_dir: true
 per_device_eval_batch_size: 1
-per_device_train_batch_size: 4
+per_device_train_batch_size: 1
 push_to_hub: false
-# report_to:
-# - wandb
+
 reward_funcs:
 - accuracy
-# - format
 - tag_count
+# - format
 reward_weights:
 - 1.0
-# - 1.0
 - 1.0
+# - 1.0
+
 save_strategy: "steps"
 wandb_log_unique_prompts: false
 save_total_limit: 1
-seed: 42
+seed: 46
 warmup_ratio: 0.1
+
+use_peft: true
+lora_r: 32
+lora_alpha: 64
+lora_target_modules: "all-linear"
+
 # Hint-based regeneration
-# Hint regeneration parameters
 enable_hint_regeneration: True
-hint_truncate_ratio: 0.35  # fallback ratio
-# hint_template: "\n\nWait, I think I made a mistake. Let me reconsider the problem step by step.\n\n"
-hint_template = "\n\nWait, let me step back. I should verify my previous step before proceeding.\n\n
-hint_regeneration_count: 3
+hint_truncate_ratio: 0.35
+# 关键修正：修复语法错误（用冒号，补全引号）
+# hint_template: "Wait, let me step back. I should verify my previous step before proceeding."
+hint_template: "Wait, let me step back and rigorously verify my previous step against three criteria: 1) Are the mathematical calculations flawlessly executed? 2) Is there any logical leap or missing assumption? 3) Are the formulas and theorems applied genuinely real and valid for this context? Let me check them one by one."
+
+hint_regeneration_count: 4
 
 # Entropy-based truncation parameters
-use_entropy_detection: False       # 是否启用熵检测
-entropy_search_start_ratio: 0.15 # 搜索区间起点 (15%)
-entropy_search_end_ratio: 0.35   # 搜索区间终点 (35%)
-entropy_threshold: 3.948           # 熵阈值
+use_entropy_detection: False
+entropy_search_start_ratio: 0.15
+entropy_search_end_ratio: 0.35
+entropy_threshold: 3.948
 max_regenerate_samples: -1
 entropy_batch_size: 2
+
 use_keyword_matching: True
-high_entropy_keywords: "therefore,perhaps,maybe,however,then,unless,because,but,actually,wait,hence,hmm,let me,since,wait,I think,so,thus"
-# enable_hint_regeneration: true
+high_entropy_keywords: "therefore,first,alternatively,perhaps,maybe,however,alternatively,then,unless,because,but,actually,wait,hence,hmm,let me,since,wait,I think,so,thus"
 
-# hint_truncate_ratio: 0.15          # 截断比例：保留前 15% 的 completion
-# hint_regeneration_count: 3         # 每个全零组重新生成的样本数，-1 表示全部重新生成
-# hint_template: "\n\nWait, I think I made a mistake. Let me reconsider the problem step by step.\n\n"
+collect_zero_acc_enabled: False
+collect_zero_acc_output_path: /gpt/work/Ryan/xz/Qwen3-1.7B-idea4/analysis/zero_acc_epoch1_prepost.jsonl
+collect_zero_acc_target_epoch: 0 #<=1 record
+collect_zero_acc_debug_every_steps: 20 #print every 20 steps
 
-# 方法1：关键词匹配（中速，推荐）
+
+# 1.7B最佳训练参数
+# Model arguments
+# model_name_or_path: /gpt/work/Ryan/xz/Qwen3-4B
+# model_revision: main
+# torch_dtype: bfloat16
+# attn_implementation: flash_attention_2
+
+# # Data training arguments
+# dataset_name: datafreak/Math-level-5  #datafreak/Math-level-5 #open-r1/DAPO-Math-17k-Processed AI-MO/NuminaMath-CoT
+# dataset_prompt_column: problem #prompt
+# dataset_split: train
+# # dataset_config: all
+# beta: 0.01
+# temperature: 0.8
+# # System Prompt (关键修正：使用单引号防止 \boxed 被转义)
+# system_prompt: 'A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant first thinks about the reasoning process in the mind and then provides the user with the answer, and put your final answer within \boxed{} . The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think> <answer> answer here </answer>.'
+
+# # GRPO trainer config
+# bf16: true
+# use_vllm: true
+# # vllm_mode: server # 注意：如果你的脚本需要 colocate，请在命令行参数里保留 --vllm_mode colocate
+
+# # 关键修正：调大 VLLM 显存比例，防止 8192 长度 OOM
+# # 建议：1.7B 模型本身很小，给 VLLM 60%-70% 显存是安全的
+# vllm_gpu_memory_utilization: 0.5
+
+# do_eval: false
+# gradient_accumulation_steps: 8
+# gradient_checkpointing: true
+# use_liger_loss: true
+# gradient_checkpointing_kwargs:
+#   use_reentrant: false
+# vllm_max_model_len: 12224
+# # learning_rate: 5.0e-06
+# learning_rate: 2.0e-06
+# log_completions: true
+# log_level: info
+# logging_first_step: true
+# logging_steps: 1
+# logging_strategy: steps
+# lr_scheduler_type: cosine
+# max_prompt_length: 1024
+# max_completion_length: 11200
+# max_steps: 350
+# num_generations: 4
+# num_train_epochs: -1
+# output_dir: /gpt/work/Ryan/xz/Qwen3-4B/to_350steps_idea4
+# overwrite_output_dir: true
+# per_device_eval_batch_size: 1
+# per_device_train_batch_size: 1
+# push_to_hub: false
+
+# reward_funcs:
+# - accuracy
+# - tag_count
+# # - format
+# reward_weights:
+# - 1.0
+# - 1.0
+# # - 1.0
+
+# save_strategy: "steps"
+# wandb_log_unique_prompts: false
+# save_total_limit: 1
+# seed: 46
+# warmup_ratio: 0.1
+
+# # use_peft: true
+# # lora_r: 32
+# # lora_alpha: 64
+# # lora_target_modules: "all-linear"
+
+# # Hint-based regeneration
 # enable_hint_regeneration: True
-# use_keyword_matching: True          # 启用关键词匹配
-# use_entropy_detection: False        # 关闭熵检测（关键词优先，这个设为False可跳过熵计算）
-# hint_truncate_ratio: 0.25           # 回退比例（关键词没找到时使用）
-# hint_template: "\n\nWait, I think I made a mistake. Let me reconsider the problem step by step.\n\n"
-# hint_regeneration_count: 2
-# high_entropy_keywords: "therefore,perhaps,maybe,however,but,actually,wait,hmm,let me,I think,so,thus"
+# hint_truncate_ratio: 0.35
+# # 关键修正：修复语法错误（用冒号，补全引号）
+# # hint_template: "Wait, let me step back. I should verify my previous step before proceeding."
+# hint_template: "Wait, let me step back and rigorously verify my previous step against three criteria: 1) Are the mathematical calculations flawlessly executed? 2) Is there any logical leap or missing assumption? 3) Are the formulas and theorems applied genuinely real and valid for this context? Let me check them one by one."
 
-# 方法2：熵检测（慢速）
-# enable_hint_regeneration: True
-# use_keyword_matching: False
-# use_entropy_detection: True
-# entropy_threshold: 3.948
+# hint_regeneration_count: 4
 
-# 方法3：固定比例（最快）
-# enable_hint_regeneration: True
-# use_keyword_matching: False
+# # Entropy-based truncation parameters
 # use_entropy_detection: False
-# hint_truncate_ratio: 0.25
+# entropy_search_start_ratio: 0.15
+# entropy_search_end_ratio: 0.35
+# entropy_threshold: 3.948
+# max_regenerate_samples: -1
+# entropy_batch_size: 2
+
+# use_keyword_matching: True
+# high_entropy_keywords: "therefore,first,alternatively,perhaps,maybe,however,alternatively,then,unless,because,but,actually,wait,hence,hmm,let me,since,wait,I think,so,thus"
+
+# collect_zero_acc_enabled: False
+# collect_zero_acc_output_path: /gpt/work/Ryan/xz/Qwen3-1.7B-idea4/analysis/zero_acc_epoch1_prepost.jsonl
+# collect_zero_acc_target_epoch: 0 #<=1 record
+# collect_zero_acc_debug_every_steps: 20 #print every 20 steps

@@ -301,6 +301,22 @@ class GRPOConfig(TrainingArguments):
         metadata={"help": "Comma-separated list of keywords that indicate high-entropy points for hint insertion."},
     )
 # ...existing code...
+    collect_zero_acc_enabled: bool = field(
+        default=False,
+        metadata={"help": "Collect pre/post completions for groups with pre-accuracy all zero."},
+    )
+    collect_zero_acc_output_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Output JSONL path for zero-acc pre/post records."},
+    )
+    collect_zero_acc_target_epoch: int = field(
+        default=0,
+        metadata={"help": "Only collect this epoch index (int part of state.epoch)."},
+    )
+    collect_zero_acc_debug_every_steps: int = field(
+        default=50,
+        metadata={"help": "Print collector debug every N steps."},
+    )
     max_completion_length: Optional[int] = field(
         default=256,
         metadata={"help": "Maximum length of the generated completion."},

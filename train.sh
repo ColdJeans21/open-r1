@@ -9,7 +9,7 @@ GRPO_CONFIG="recipes/Qwen2.5-1.5B-Instruct/grpo/config_demo1.yaml"  # GRPO 配�
 LOG_LEVEL="info"  # 日志级别（info/warning/error）
 export WANDB_MODE=offline
 export RAY_DISABLE_METRICS_EXPORTER=1
-export CUDA_VISIBLE_DEVICES=0,1,2,3
+export CUDA_VISIBLE_DEVICES=1
 # ====================================================================
 
 # 执行训练命令

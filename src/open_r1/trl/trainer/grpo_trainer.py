@@ -20,6 +20,8 @@ from collections.abc import Sized
 from contextlib import nullcontext
 from typing import Any, Callable, Optional, Union
 
+
+
 import datasets
 import torch
 import torch.utils.data
@@ -46,6 +48,8 @@ from transformers.trainer_utils import seed_worker
 from transformers.utils import is_datasets_available, is_peft_available, is_rich_available
 
 from .hint_regeneration import HintRegenerator
+import copy
+from .zero_acc_collector import ZeroAccCollectorConfig, ZeroAccEpochCollector
 from ..data_utils import apply_chat_template, is_conversational, maybe_apply_chat_template
 from ..extras.profiling import profiling_context, profiling_decorator
 from ..extras.vllm_client import VLLMClient
@@ -614,7 +618,25 @@ class GRPOTrainer(Trainer):
 
         self.enable_hint_regeneration = getattr(args, 'enable_hint_regeneration', False)
         self.hint_regenerator = None
-        
+        collect_enabled = getattr(args, "collect_zero_acc_enabled", False)
+        collect_out = getattr(
+            args,
+            "collect_zero_acc_output_path",
+            os.path.join(args.output_dir, "zero_acc_epoch_prepost.jsonl"),
+        )
+        collect_epoch = int(getattr(args, "collect_zero_acc_target_epoch", 0))
+        collect_debug = int(getattr(args, "collect_zero_acc_debug_every_steps", 50))
+
+        self.zero_acc_collector = ZeroAccEpochCollector(
+            ZeroAccCollectorConfig(
+                enabled=collect_enabled,
+                output_path=collect_out,
+                target_epoch=collect_epoch,
+                num_generations=int(args.num_generations),
+                train_only=True,
+                debug_every_steps=collect_debug,
+            )
+        )
 
         if self.use_vllm:
             if not is_vllm_available():
@@ -1161,6 +1183,7 @@ class GRPOTrainer(Trainer):
             truncated_completions=truncated_completions,
             hint_ids_list=hint_ids_list,
             max_new_tokens=reduced_max_tokens,
+            max_total_completion_len=self.max_completion_length,
         )
         
         # 立即释放生成输入
@@ -1686,7 +1709,7 @@ class GRPOTrainer(Trainer):
                             prompts=all_generation_prompts,
                             n=1,
                             repetition_penalty=self.repetition_penalty,
-                            temperature=0.9,
+                            temperature=self.temperature,
                             top_p=self.top_p,
                             top_k=-1 if self.top_k is None else self.top_k,
                             min_p=0.0 if self.min_p is None else self.min_p,
@@ -1717,7 +1740,7 @@ class GRPOTrainer(Trainer):
                 sampling_params = SamplingParams(
                     n=1,
                     repetition_penalty=self.repetition_penalty,
-                    temperature=0.9,
+                    temperature=self.temperature,
                     top_p=self.top_p,
                     top_k=-1 if self.top_k is None else self.top_k,
                     min_p=0.0 if self.min_p is None else self.min_p,
@@ -2010,6 +2033,9 @@ class GRPOTrainer(Trainer):
 
         rewards_per_func = torch.zeros(len(prompts), len(self.reward_funcs), device=device)
 
+        
+
+
         # Repeat all input columns (but "prompt", "completion", and "completion_ids") to match the num of generations
         keys = [key for key in inputs[0] if key not in ["prompt", "completion", "completion_ids"]]
         reward_kwargs = {key: [example[key] for example in inputs] for key in keys}
@@ -2074,8 +2100,9 @@ class GRPOTrainer(Trainer):
         #                 reward_kwargs=reward_kwargs,
         #                 inputs=inputs,
         #             )
+        pre_rewards_per_func = rewards_per_func.clone()
+        pre_completions = copy.deepcopy(completions)
         is_regenerated = [False] * len(completions)
-        is_regenerated_tensor = torch.tensor(is_regenerated, dtype=torch.bool, device=device)
 
         if mode == "train" and self.enable_hint_regeneration:
             if self.use_vllm:
@@ -2120,7 +2147,8 @@ class GRPOTrainer(Trainer):
             
             # Update completion_lengths for logging
             completion_lengths = completion_mask.sum(1)
-            
+
+            completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
             # Recalculate logps if needed
             logits_to_keep = completion_ids.size(1)
             with torch.no_grad():
@@ -2128,6 +2156,19 @@ class GRPOTrainer(Trainer):
                     old_per_token_logps = self._get_per_token_logps(
                         self.model, prompt_completion_ids, attention_mask, logits_to_keep, batch_size
                     )
+        self.zero_acc_collector.capture_pre_post(
+            mode=mode,
+            epoch_float=float(self.state.epoch) if self.state.epoch is not None else 0.0,
+            global_step=int(self.state.global_step),
+            reward_func_names=self.reward_func_names,
+            pre_rewards_per_func=pre_rewards_per_func,
+            post_rewards_per_func=rewards_per_func,
+            prompts=prompts,
+            pre_completions=pre_completions,
+            post_completions=completions,
+            is_regenerated=is_regenerated,
+        )
+        is_regenerated_tensor = torch.tensor(is_regenerated, dtype=torch.bool, device=device)
 
 
         # If all reward functions return None for a given row, issue a detailed warning
@@ -2168,22 +2209,48 @@ class GRPOTrainer(Trainer):
         all_process_advantages = advantages.clone()  # keep the aggregated advantages for logging
         advantages = advantages[process_slice]
 
+        adv_abs_mean = advantages.abs().mean().item()
+        adv_nonzero_ratio = (advantages.abs() > 1e-8).float().mean().item()
+        self._metrics[mode]["advantages/abs_mean"].append(adv_abs_mean)
+        self._metrics[mode]["advantages/nonzero_ratio"].append(adv_nonzero_ratio)
+
         # Log the metrics
         if mode == "train":
             self.state.num_input_tokens_seen += self.accelerator.gather(attention_mask.sum()).sum().item()
         self._metrics[mode]["num_tokens"] = [self.state.num_input_tokens_seen]
 
         # Log completion lengths, mean, min, max
+        # agg_completion_lengths = self.accelerator.gather(completion_lengths)
+        # self._metrics[mode]["completions/mean_length"].append(agg_completion_lengths.float().mean().item())
+        # self._metrics[mode]["completions/min_length"].append(agg_completion_lengths.float().min().item())
+        # self._metrics[mode]["completions/max_length"].append(agg_completion_lengths.float().max().item())
+
+        # # Identify sequences that terminated with EOS and log their lengths
+        # agg_terminated_with_eos = self.accelerator.gather(is_eos.any(dim=1))
+        # term_completion_lengths = agg_completion_lengths[agg_terminated_with_eos]
+        # clipped_completions_ratio = 1 - len(term_completion_lengths) / len(completion_lengths)
+        # self._metrics[mode]["completions/clipped_ratio"].append(clipped_completions_ratio)
+        # if len(term_completion_lengths) == 0:  # edge case where no terminated sequences are found
+        #     term_completion_lengths = torch.zeros(1, device=device)
+        # self._metrics[mode]["completions/mean_terminated_length"].append(term_completion_lengths.float().mean().item())
+        # self._metrics[mode]["completions/min_terminated_length"].append(term_completion_lengths.float().min().item())
+        # self._metrics[mode]["completions/max_terminated_length"].append(term_completion_lengths.float().max().item())
+
         agg_completion_lengths = self.accelerator.gather(completion_lengths)
         self._metrics[mode]["completions/mean_length"].append(agg_completion_lengths.float().mean().item())
         self._metrics[mode]["completions/min_length"].append(agg_completion_lengths.float().min().item())
         self._metrics[mode]["completions/max_length"].append(agg_completion_lengths.float().max().item())
 
-        # Identify sequences that terminated with EOS and log their lengths
-        agg_terminated_with_eos = self.accelerator.gather(is_eos.any(dim=1))
-        term_completion_lengths = agg_completion_lengths[agg_terminated_with_eos]
-        clipped_completions_ratio = 1 - len(term_completion_lengths) / len(completion_lengths)
-        self._metrics[mode]["completions/clipped_ratio"].append(clipped_completions_ratio)
+        # 用当前 batch 的 completion_mask 计算 clipped_ratio，范围保证在 [0,1]
+        completion_lens = completion_mask.sum(dim=1).float()
+        agg_completion_lens = self.accelerator.gather(completion_lens)
+        clipped_ratio = (agg_completion_lens >= float(self.max_completion_length)).float().mean().item()
+        self._metrics[mode]["completions/clipped_ratio"].append(clipped_ratio)
+
+        # terminated 长度统计（建议基于更新后的 completion_ids 重新计算）
+        is_eos_after_regen = completion_ids == self.processing_class.eos_token_id
+        agg_terminated_with_eos = self.accelerator.gather(is_eos_after_regen.any(dim=1))
+        term_completion_lengths = agg_completion_lens[agg_terminated_with_eos]
         if len(term_completion_lengths) == 0:  # edge case where no terminated sequences are found
             term_completion_lengths = torch.zeros(1, device=device)
         self._metrics[mode]["completions/mean_terminated_length"].append(term_completion_lengths.float().mean().item())
@@ -2359,6 +2426,7 @@ class GRPOTrainer(Trainer):
         self._metrics[mode]["clip_ratio/high_max"].append(nanmax(gathered_high_clip).item())
         gathered_clip_ratio = self.accelerator.gather(clip_ratio)
         self._metrics[mode]["clip_ratio/region_mean"].append(gathered_clip_ratio.nanmean().item())
+        self._metrics[mode]["loss/raw_fp32"].append(float(loss.detach().float().item()))
         return loss
 
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys: Optional[list[str]] = None):

@@ -111,12 +111,83 @@ class HintRegenerator:
     
     # ============ 新增：关键词匹配方法 ============
     
+    # def find_keyword_position(
+    #     self,
+    #     completion_text: str,
+    #     completion_ids: torch.Tensor,
+    #     completion_mask: torch.Tensor,
+    # ) -> int:
+    #     """
+    #     Find truncation position based on keyword matching.
+        
+    #     Logic:
+    #     1. Search within [entropy_search_start_ratio, entropy_search_end_ratio] of the completion text
+    #     2. Find keywords like "therefore", "perhaps", etc.
+    #     3. Select the one closest to entropy_search_end_ratio (e.g., 35%)
+    #     4. Find the end of the sentence containing this keyword
+        
+    #     Args:
+    #         completion_text: Decoded completion text
+    #         completion_ids: Token IDs
+    #         completion_mask: Completion mask
+            
+    #     Returns:
+    #         Token position to truncate at
+    #     """
+    #     completion_length = int(completion_mask.sum().item())
+    #     text_length = len(completion_text)
+        
+    #     if text_length < 20 or completion_length < 10:
+    #         return max(1, int(completion_length * self.truncate_ratio))
+        
+    #     # Define search range in characters
+    #     search_start_char = int(text_length * self.entropy_search_start_ratio)
+    #     search_end_char = int(text_length * self.entropy_search_end_ratio)
+        
+    #     if self.keyword_pattern is None:
+    #         # No keywords, use fallback
+    #         fallback_char = (search_start_char + search_end_char) // 2
+    #         return self._char_to_token_position_fast(
+    #             completion_ids[:completion_length], fallback_char, completion_text
+    #         )
+        
+    #     # Search for keywords in the range
+    #     search_text = completion_text[search_start_char:search_end_char]
+    #     matches = list(self.keyword_pattern.finditer(search_text))
+        
+    #     if not matches:
+    #         # No keyword found, use fallback (middle of search range)
+    #         fallback_char = (search_start_char + search_end_char) // 2
+    #         return self._char_to_token_position_fast(
+    #             completion_ids[:completion_length], fallback_char, completion_text
+    #         )
+        
+    #     # Select the last match (closest to entropy_search_end_ratio)
+    #     last_match = matches[-1]
+    #     keyword_end_char = search_start_char + last_match.end()
+        
+    #     # Find the end of the sentence containing this keyword
+    #     remaining_text = completion_text[keyword_end_char:]
+    #     sentence_end_match = self.SENTENCE_END_PATTERN.search(remaining_text)
+        
+    #     if sentence_end_match:
+    #         truncate_char = keyword_end_char + sentence_end_match.end()
+    #     else:
+    #         # No sentence end found, use keyword position + small offset
+    #         truncate_char = min(keyword_end_char + 50, text_length)
+        
+    #     # Convert character position to token position
+    #     truncate_pos = self._char_to_token_position_fast(
+    #         completion_ids[:completion_length], truncate_char, completion_text
+    #     )
+        
+    #     return min(truncate_pos, completion_length - 1)
     def find_keyword_position(
-        self,
-        completion_text: str,
-        completion_ids: torch.Tensor,
-        completion_mask: torch.Tensor,
-    ) -> int:
+    self,
+    completion_text: str,
+    completion_ids: torch.Tensor,
+    completion_mask: torch.Tensor,
+) -> int:
         """
         Find truncation position based on keyword matching.
         
@@ -124,7 +195,7 @@ class HintRegenerator:
         1. Search within [entropy_search_start_ratio, entropy_search_end_ratio] of the completion text
         2. Find keywords like "therefore", "perhaps", etc.
         3. Select the one closest to entropy_search_end_ratio (e.g., 35%)
-        4. Find the end of the sentence containing this keyword
+        4. Truncate right after the keyword (not at sentence end)  # <-- 修改说明
         
         Args:
             completion_text: Decoded completion text
@@ -166,15 +237,18 @@ class HintRegenerator:
         last_match = matches[-1]
         keyword_end_char = search_start_char + last_match.end()
         
-        # Find the end of the sentence containing this keyword
-        remaining_text = completion_text[keyword_end_char:]
-        sentence_end_match = self.SENTENCE_END_PATTERN.search(remaining_text)
+        # ============ 修改这里：直接在关键词后面截断 ============
+        # 原来的代码（找句子末尾）:
+        # remaining_text = completion_text[keyword_end_char:]
+        # sentence_end_match = self.SENTENCE_END_PATTERN.search(remaining_text)
+        # if sentence_end_match:
+        #     truncate_char = keyword_end_char + sentence_end_match.end()
+        # else:
+        #     truncate_char = min(keyword_end_char + 50, text_length)
         
-        if sentence_end_match:
-            truncate_char = keyword_end_char + sentence_end_match.end()
-        else:
-            # No sentence end found, use keyword position + small offset
-            truncate_char = min(keyword_end_char + 50, text_length)
+        # 新代码：直接在关键词后面截断
+        truncate_char = keyword_end_char
+        # ============ 修改结束 ============
         
         # Convert character position to token position
         truncate_pos = self._char_to_token_position_fast(
@@ -572,6 +646,7 @@ class HintRegenerator:
         truncated_completions: list[torch.Tensor],
         hint_ids_list: list[torch.Tensor],
         max_new_tokens: Optional[int] = None,
+        max_total_completion_len: Optional[int] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Generate new completions and build final completion."""
         device = generation_input_ids.device
@@ -624,6 +699,8 @@ class HintRegenerator:
                 newly_gen = newly_gen[:eos_pos + 1]
             
             final_completion = torch.cat([truncated, hint, newly_gen], dim=0)
+            if max_total_completion_len is not None and final_completion.size(0) > max_total_completion_len:
+                final_completion = final_completion[:max_total_completion_len]
             final_completion_list.append(final_completion)
         
         max_completion_len = max(c.size(0) for c in final_completion_list)
