@@ -1,12 +1,16 @@
 """
 Hint-based regeneration module for GRPO training.
 
-Structure after regeneration:
+Structure after regeneration (when delimiter found before truncation position):
+    Prompt: [Original Prompt] (unchanged)
+    Completion: <think> + [Content: delimiter→keyword] + [Hint] + [Newly Generated Part]
+
+All content before the delimiter is DISCARDED except the <think> tag.
+Content from delimiter (e.g. \\n) to keyword is kept as context for re-thinking.
+
+Structure after regeneration (fallback, no delimiter found):
     Prompt: [Original Prompt] (unchanged)
     Completion: [Truncated Part] + [Hint] + [Newly Generated Part]
-    
-The Hint is inserted after a high-entropy token's sentence within the search range,
-encouraging the model to learn self-check behavior at critical reasoning points.
 """
 
 import re
@@ -56,6 +60,7 @@ class HintRegenerator:
         # 新增：关键词匹配参数
         use_keyword_matching: bool = False,        # 是否使用关键词匹配
         high_entropy_keywords: Optional[str] = None,  # 关键词列表（逗号分隔字符串）
+        hint_delimiter: str = "\n",               # 截断分隔符：在截断位置前找该符号
     ):
         self.processing_class = processing_class
         self.generation_config = generation_config
@@ -76,7 +81,10 @@ class HintRegenerator:
         
         # 关键词匹配参数
         self.use_keyword_matching = use_keyword_matching
-        
+
+        # delimiter 参数
+        self.hint_delimiter = hint_delimiter
+
         # 解析关键词
         if high_entropy_keywords is None:
             self.high_entropy_keywords = self.DEFAULT_HIGH_ENTROPY_KEYWORDS
@@ -97,6 +105,8 @@ class HintRegenerator:
         
         # 预先编码 hint
         self._hint_ids = None
+        # 预先编码 <think> 标签
+        self._think_ids = None
     
     @property
     def hint_ids(self) -> torch.Tensor:
@@ -108,8 +118,27 @@ class HintRegenerator:
                 return_tensors="pt"
             ).squeeze(0)
         return self._hint_ids
-    
-    # ============ 新增：关键词匹配方法 ============
+
+    @property
+    def think_ids(self) -> torch.Tensor:
+        """Lazily encode <think> tag."""
+        if self._think_ids is None:
+            self._think_ids = self.processing_class.encode(
+                "<think>",
+                add_special_tokens=False,
+                return_tensors="pt"
+            ).squeeze(0)
+        return self._think_ids
+
+    def _find_delimiter_before(self, completion_text: str, char_pos: int) -> int:
+        """
+        Find the last occurrence of hint_delimiter before char_pos in completion_text.
+        Returns the character index of the start of the delimiter, or -1 if not found.
+        """
+        if not self.hint_delimiter:
+            return -1
+        text_before = completion_text[:char_pos]
+        return text_before.rfind(self.hint_delimiter)
     
     # def find_keyword_position(
     #     self,
@@ -545,14 +574,48 @@ class HintRegenerator:
             else:
                 # 方法3：固定比例（最快）
                 truncate_pos = max(1, int(completion_length * self.truncate_ratio))
-            
+
             truncate_positions.append(truncate_pos)
-            
-            truncated_completion = comp_ids[:truncate_pos]
-            truncated_completions.append(truncated_completion)
-            hint_ids_list.append(hint_ids.clone())
-            
-            gen_input = torch.cat([orig_prompt, truncated_completion, hint_ids], dim=0)
+
+            # ============ delimiter-aware truncation ============
+            valid_ids = comp_ids[:completion_length]
+            keyword_text = self.processing_class.decode(
+                valid_ids[:truncate_pos], skip_special_tokens=True
+            )
+            keyword_char_pos = len(keyword_text)
+
+            delim_char_pos = self._find_delimiter_before(comp_text, keyword_char_pos)
+
+            if delim_char_pos >= 0:
+                # delimiter found: keep <think> from before \n, discard everything else
+                # suffix = \n + content between \n and keyword
+                delim_token_pos = self._char_to_token_position_fast(
+                    valid_ids, delim_char_pos, comp_text
+                )
+                suffix_ids = valid_ids[delim_token_pos:truncate_pos]
+
+                # prefix = <think> + suffix (everything before \n is dropped except <think>)
+                think_ids_dev = self.think_ids.to(device)
+                prefix_completion = torch.cat(
+                    [think_ids_dev, suffix_ids], dim=0
+                )
+                truncated_completions.append(prefix_completion)
+                hint_ids_list.append(hint_ids.clone())
+
+                # gen_input = prompt + prefix + hint
+                gen_input = torch.cat(
+                    [orig_prompt, prefix_completion, hint_ids], dim=0
+                )
+            else:
+                # no delimiter found: fallback to original behavior
+                truncated_completion = comp_ids[:truncate_pos]
+                truncated_completions.append(truncated_completion)
+                hint_ids_list.append(hint_ids.clone())
+
+                gen_input = torch.cat(
+                    [orig_prompt, truncated_completion, hint_ids], dim=0
+                )
+
             gen_mask = torch.ones(gen_input.size(0), dtype=torch.long, device=device)
             
             generation_input_list.append(gen_input)
@@ -589,27 +652,63 @@ class HintRegenerator:
         """Build inputs for generation (fallback without entropy)."""
         device = prompt_ids.device
         num_regenerate = len(regenerate_indices)
-        
+
         generation_input_list = []
         generation_mask_list = []
         truncated_completions = []
         hint_ids_list = []
-        
+
         hint_ids = self.hint_ids.to(device)
-        
+
         for idx in regenerate_indices:
             idx_val = idx.item()
-            
+
             orig_prompt = prompt_ids[idx_val][prompt_mask[idx_val] == 1]
-            
+
+            comp_ids = completion_ids[idx_val]
             completion_length = int(completion_mask[idx_val].sum().item())
             truncate_pos = max(1, int(completion_length * self.truncate_ratio))
-            
-            truncated_completion = completion_ids[idx_val][:truncate_pos]
-            truncated_completions.append(truncated_completion)
-            hint_ids_list.append(hint_ids.clone())
-            
-            gen_input = torch.cat([orig_prompt, truncated_completion, hint_ids], dim=0)
+
+            # delimiter-aware truncation (same logic as build_generation_inputs_with_entropy)
+            valid_ids = comp_ids[:completion_length]
+            trunc_text = self.processing_class.decode(
+                valid_ids[:truncate_pos], skip_special_tokens=True
+            )
+            trunc_char_pos = len(trunc_text)
+
+            # Decode full completion text for delimiter search
+            full_comp_text = self.processing_class.decode(
+                valid_ids, skip_special_tokens=True
+            )
+            delim_char_pos = self._find_delimiter_before(full_comp_text, trunc_char_pos)
+
+            if delim_char_pos >= 0:
+                # delimiter found: keep <think> from before \n, discard everything else
+                delim_token_pos = self._char_to_token_position_fast(
+                    valid_ids, delim_char_pos, full_comp_text
+                )
+                suffix_ids = valid_ids[delim_token_pos:truncate_pos]
+
+                think_ids_dev = self.think_ids.to(device)
+                # prefix = <think> + suffix (everything before \n is dropped except <think>)
+                prefix_completion = torch.cat(
+                    [think_ids_dev, suffix_ids], dim=0
+                )
+                truncated_completions.append(prefix_completion)
+                hint_ids_list.append(hint_ids.clone())
+
+                gen_input = torch.cat(
+                    [orig_prompt, prefix_completion, hint_ids], dim=0
+                )
+            else:
+                truncated_completion = completion_ids[idx_val][:truncate_pos]
+                truncated_completions.append(truncated_completion)
+                hint_ids_list.append(hint_ids.clone())
+
+                gen_input = torch.cat(
+                    [orig_prompt, truncated_completion, hint_ids], dim=0
+                )
+
             gen_mask = torch.ones(gen_input.size(0), dtype=torch.long, device=device)
             
             generation_input_list.append(gen_input)

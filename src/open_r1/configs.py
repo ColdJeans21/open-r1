@@ -329,3 +329,10 @@ class GRPOScriptArguments(ScriptArguments):
         default=4096,
         metadata={"help": "Minimum number of characters in completion."},
     )
+    hint_delimiter: str = field(
+        default="\n",
+        metadata={"help": "Delimiter character for hint regeneration truncation. "
+                  "The last occurrence of this delimiter before the keyword/truncation position "
+                  "is used as the actual truncation boundary. Content between the delimiter "
+                  "and the keyword is prepended with <think> tag and used as context for resampling."},
+    )

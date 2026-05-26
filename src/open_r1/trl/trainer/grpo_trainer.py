@@ -600,9 +600,9 @@ class GRPOTrainer(Trainer):
         self.log_completions = args.log_completions
         self.wandb_log_unique_prompts = args.wandb_log_unique_prompts
         self.num_completions_to_print = args.num_completions_to_print
-        # maxlen is set to the total number of forward passes per step. This value of `maxlen` ensures we log only the
-        # final optimization step.
-        maxlen = self.accelerator.num_processes * args.per_device_train_batch_size * args.steps_per_generation
+        # maxlen is set to the total number of completions per optimization step (accounts for num_generations).
+        # This value of `maxlen` ensures we log only the final optimization step.
+        maxlen = 128
         self._textual_logs = {
             "prompt": deque(maxlen=maxlen),
             "completion": deque(maxlen=maxlen),
@@ -741,6 +741,7 @@ class GRPOTrainer(Trainer):
                 # 新增：关键词匹配参数
                 use_keyword_matching=getattr(args, 'use_keyword_matching', False),
                 high_entropy_keywords=getattr(args, 'high_entropy_keywords', None),
+                hint_delimiter=getattr(args, 'hint_delimiter', '\n'),
             )
 
         
@@ -1657,12 +1658,19 @@ class GRPOTrainer(Trainer):
                 original_completion = completions_text[idx_val]
                 if isinstance(original_completion, list):
                     original_completion = original_completion[0]["content"] if original_completion else ""
-                
+
                 comp_mask = completion_mask[idx_val]
                 comp_ids = completion_ids[idx_val]
                 completion_length = int(comp_mask.sum().item())
-                
-                if self.hint_regenerator.use_entropy_detection and idx_val in token_entropies:
+
+                # ===== truncation method selection (same priority as hint_regeneration.py) =====
+                if self.hint_regenerator.use_keyword_matching:
+                    truncate_pos = self.hint_regenerator.find_keyword_position(
+                        completion_text=original_completion,
+                        completion_ids=comp_ids,
+                        completion_mask=comp_mask,
+                    )
+                elif self.hint_regenerator.use_entropy_detection and idx_val in token_entropies:
                     truncate_pos = self.hint_regenerator.find_high_entropy_position(
                         token_entropy=token_entropies[idx_val],
                         completion_mask=comp_mask,
@@ -1671,15 +1679,41 @@ class GRPOTrainer(Trainer):
                     )
                 else:
                     truncate_pos = max(1, int(completion_length * self.hint_regenerator.truncate_ratio))
-                
+
                 truncate_positions.append(truncate_pos)
-                
+
+                # ===== delimiter-aware truncation =====
                 valid_ids = comp_ids[:completion_length]
-                truncated_text = self.processing_class.decode(valid_ids[:truncate_pos], skip_special_tokens=True)
-                truncated_completions_text.append(truncated_text)
-                
-                generation_prompt = original_prompt + truncated_text + hint_text
-                generation_prompts_text.append(generation_prompt)
+                keyword_text = self.processing_class.decode(
+                    valid_ids[:truncate_pos], skip_special_tokens=True
+                )
+                keyword_char_pos = len(keyword_text)
+
+                delim_char_pos = self.hint_regenerator._find_delimiter_before(
+                    original_completion, keyword_char_pos
+                )
+
+                if delim_char_pos >= 0:
+                    # delimiter found: keep <think> from before \n, discard everything else
+                    # suffix = \n + content between \n and keyword
+                    suffix_text = original_completion[delim_char_pos:keyword_char_pos]
+
+                    # prefix = <think> + suffix (everything before \n is dropped except <think>)
+                    prefix_text = "<think>" + suffix_text
+                    truncated_completions_text.append(prefix_text)
+
+                    # generation prompt = original_prompt + prefix + hint
+                    generation_prompt = original_prompt + prefix_text + hint_text
+                    generation_prompts_text.append(generation_prompt)
+                else:
+                    # no delimiter found: fallback to original behavior
+                    truncated_text = self.processing_class.decode(
+                        valid_ids[:truncate_pos], skip_special_tokens=True
+                    )
+                    truncated_completions_text.append(truncated_text)
+
+                    generation_prompt = original_prompt + truncated_text + hint_text
+                    generation_prompts_text.append(generation_prompt)
         
         del token_entropies
         torch.cuda.empty_cache()

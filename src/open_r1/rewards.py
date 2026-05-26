@@ -77,8 +77,27 @@ def accuracy_reward(completions: list[list[dict[str, str]]], solution: list[str]
     contents = [completion[0]["content"] for completion in completions]
     rewards = []
     for content, sol in zip(contents, solution):
+        # Quick check: skip proof-style problems where \boxed{} is empty
+        # Use simple substring to avoid regex escaping issues with \boxed
+        if 'boxed{}' in sol.replace(' ', '').replace('\t', '').replace('\n', ''):
+            rewards.append(None)
+            continue
         gold_parsed = parse(
             sol,
+            extraction_config=[
+                LatexExtractionConfig(
+                    normalization_config=NormalizationConfig(
+                        nits=False,
+                        malformed_operators=False,
+                        basic_latex=True,
+                        equations=True,
+                        boxed="all",
+                        units=True,
+                    ),
+                    boxed_match_priority=0,
+                    try_extract_without_anchor=True,
+                )
+            ],
             extraction_mode="first_match",
         )
         if len(gold_parsed) != 0:
@@ -109,9 +128,8 @@ def accuracy_reward(completions: list[list[dict[str, str]]], solution: list[str]
                 print(f"verify failed: {e}, answer: {answer_parsed}, gold: {gold_parsed}")
                 reward = None
         else:
-            # If the gold solution is not parseable, we assign `None` to skip this example
+            # If the gold solution is not parseable, skip this example silently
             reward = None
-            print("Failed to parse gold solution: ", sol)
         rewards.append(reward)
 
     return rewards

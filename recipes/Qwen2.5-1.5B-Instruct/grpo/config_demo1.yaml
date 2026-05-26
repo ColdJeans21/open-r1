@@ -1,12 +1,12 @@
 # Model arguments
-model_name_or_path: /gpt/work/Ryan/xz/Qwen3-8B
+model_name_or_path: /gpt/work/Ryan/xz/Qwen3-4B
 model_revision: main
 torch_dtype: bfloat16
 attn_implementation: flash_attention_2
 
 # Data training arguments
-dataset_name: datafreak/Math-level-5  #datafreak/Math-level-5 #open-r1/DAPO-Math-17k-Processed AI-MO/NuminaMath-CoT
-dataset_prompt_column: problem #prompt
+dataset_name: AI-MO/NuminaMath-CoT  #GAIR/LIMO datafreak/Math-level-5 #open-r1/DAPO-Math-17k-Processed AI-MO/NuminaMath-CoT
+dataset_prompt_column: problem #promptproblem
 dataset_split: train
 # dataset_config: all
 beta: 0.01
@@ -39,11 +39,11 @@ logging_steps: 1
 logging_strategy: steps
 lr_scheduler_type: cosine
 max_prompt_length: 1024
-max_completion_length: 11200
-max_steps: 350
-num_generations: 4
+max_completion_length: 4096
+max_steps: 10
+num_generations: 8
 num_train_epochs: -1
-output_dir: /gpt/work/Ryan/xz/Qwen3-8B/to_350steps_idea4
+output_dir: /gpt/work/Ryan/xz/Qwen3-4B/to_10steps_idea6
 overwrite_output_dir: true
 per_device_eval_batch_size: 1
 per_device_train_batch_size: 1
@@ -61,10 +61,10 @@ reward_weights:
 save_strategy: "steps"
 wandb_log_unique_prompts: false
 save_total_limit: 1
-seed: 46
+seed: 49
 warmup_ratio: 0.1
 
-use_peft: true
+use_peft: false
 lora_r: 32
 lora_alpha: 64
 lora_target_modules: "all-linear"
@@ -74,9 +74,10 @@ enable_hint_regeneration: True
 hint_truncate_ratio: 0.35
 # 关键修正：修复语法错误（用冒号，补全引号）
 # hint_template: "Wait, let me step back. I should verify my previous step before proceeding."
-hint_template: "Wait, let me step back and rigorously verify my previous step against three criteria: 1) Are the mathematical calculations flawlessly executed? 2) Is there any logical leap or missing assumption? 3) Are the formulas and theorems applied genuinely real and valid for this context? Let me check them one by one."
+hint_template: "Wait, let me step back and rigorously verify my previous step against three criteria: 1) Are the mathematical calculations flawlessly executed? 2) Is there any logical leap or missing assumption? 3) Are the formulas and theorems applied genuinely real and valid for this context? Let me check them one by one.\n\n"
+# hint_template: "Wait, let me check step by step."
 
-hint_regeneration_count: 4
+hint_regeneration_count: 8
 
 # Entropy-based truncation parameters
 use_entropy_detection: False
@@ -87,7 +88,9 @@ max_regenerate_samples: -1
 entropy_batch_size: 2
 
 use_keyword_matching: True
-high_entropy_keywords: "therefore,first,alternatively,perhaps,maybe,however,alternatively,then,unless,because,but,actually,wait,hence,hmm,let me,since,wait,I think,so,thus"
+# high_entropy_keywords: "therefore,first,alternatively,perhaps,maybe,however,alternatively,then,unless,because,but,actually,wait,hence,hmm,let me,since,wait,I think,so,thus"
+high_entropy_keywords: "\n\n"
+hint_delimiter: "\n\n"
 
 collect_zero_acc_enabled: False
 collect_zero_acc_output_path: /gpt/work/Ryan/xz/Qwen3-1.7B-idea4/analysis/zero_acc_epoch1_prepost.jsonl
@@ -186,6 +189,7 @@ collect_zero_acc_debug_every_steps: 20 #print every 20 steps
 
 # use_keyword_matching: True
 # high_entropy_keywords: "therefore,first,alternatively,perhaps,maybe,however,alternatively,then,unless,because,but,actually,wait,hence,hmm,let me,since,wait,I think,so,thus"
+# hint_delimiter: "\n"
 
 # collect_zero_acc_enabled: False
 # collect_zero_acc_output_path: /gpt/work/Ryan/xz/Qwen3-1.7B-idea4/analysis/zero_acc_epoch1_prepost.jsonl
