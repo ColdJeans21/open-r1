@@ -164,6 +164,14 @@ class GRPOConfig(trl.GRPOConfig):
         default=None,
         metadata={"help": ("The group to store runs under.")},
     )
+    collect_zero_acc_enabled: bool = field(
+        default=False,
+        metadata={"help": "If True, collect queries where all G completions have accuracy=0 and save to JSON."},
+    )
+    collect_zero_acc_output_path: str = field(
+        default="./zero_acc_queries.json",
+        metadata={"help": "Path to save zero-accuracy queries JSON file."},
+    )
 
 
 @dataclass

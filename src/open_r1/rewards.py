@@ -38,9 +38,29 @@ from .utils.competitive_programming import score_subtask
 
 
 def accuracy_reward(completions: list[list[dict[str, str]]], solution: list[str], **kwargs) -> list[Optional[float]]:
-    """Reward function that checks if the completion is the same as the ground truth."""
+    """Reward function that checks if the completion is the same as the ground truth.
+
+    When the dataset provides an ``answer`` column (e.g. GAIR/LIMO with pure numeric
+    answers), it is used in preference to ``solution`` for direct string comparison
+    against the extracted \\boxed{} content.
+    """
     contents = [completion[0]["content"] for completion in completions]
     rewards = []
+
+    # GAIR/LIMO provides a direct answer string; use it for simpler, more reliable matching
+    direct_answers = kwargs.get("answer", None)
+    if direct_answers is not None:
+        for content, gold in zip(contents, direct_answers):
+            gold = str(gold).strip()
+            # Extract \boxed{...} content from the completion
+            boxed_match = re.search(r"\\boxed\{([^}]*)\}", content)
+            if boxed_match:
+                pred = boxed_match.group(1).strip()
+                rewards.append(1.0 if pred == gold else 0.0)
+            else:
+                rewards.append(0.0)
+        return rewards
+
     for content, sol in zip(contents, solution):
         gold_parsed = parse(
             sol,

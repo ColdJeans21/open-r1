@@ -1,0 +1,63 @@
+# Model arguments
+model_name_or_path: /gpt/work/Ryan/xz/Qwen3-4B
+model_revision: main
+torch_dtype: bfloat16
+attn_implementation: flash_attention_2
+
+# Data training arguments
+dataset_name: GAIR/LIMO
+dataset_prompt_column: question
+dataset_split: train
+beta: 0.01
+temperature: 0.8
+system_prompt: 'A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant first thinks about the reasoning process in the mind and then provides the user with the answer, and put your final answer within \boxed{} . The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think> <answer> answer here </answer>.'
+
+# GRPO trainer config
+bf16: true
+use_vllm: true
+vllm_mode: colocate
+vllm_gpu_memory_utilization: 0.28
+vllm_max_model_len: 8192
+
+do_eval: false
+gradient_accumulation_steps: 8
+gradient_checkpointing: true
+use_liger_loss: true
+gradient_checkpointing_kwargs:
+  use_reentrant: false
+learning_rate: 2.0e-06
+log_completions: true
+log_level: info
+logging_first_step: true
+logging_steps: 1
+logging_strategy: steps
+lr_scheduler_type: cosine
+max_prompt_length: 512
+max_completion_length: 5120
+max_steps: -1 # -1
+num_train_epochs: 1
+num_generations: 8
+output_dir: /gpt/work/Ryan/xz/Qwen3-4B/1epochGAIR_LIMO_difficuProbl_0acc
+overwrite_output_dir: true
+per_device_eval_batch_size: 1
+per_device_train_batch_size: 1
+push_to_hub: false
+
+reward_funcs:
+- accuracy
+- tag_count
+reward_weights:
+- 1.0
+- 1.0
+
+save_strategy: "steps"
+wandb_log_unique_prompts: false
+save_total_limit: 1
+seed: 49
+warmup_ratio: 0.1
+
+use_peft: false
+
+# Zero-accuracy query collection
+collect_zero_acc_enabled: True
+collect_zero_acc_output_path: /gpt/work/Ryan/xz/Qwen3-4B/limo_zero_acc_experiment/zero_acc_queries.json

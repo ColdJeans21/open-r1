@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+import json
 import textwrap
 import warnings
 from collections import defaultdict, deque
@@ -595,9 +596,8 @@ class GRPOTrainer(Trainer):
         self.log_completions = args.log_completions
         self.wandb_log_unique_prompts = args.wandb_log_unique_prompts
         self.num_completions_to_print = args.num_completions_to_print
-        # maxlen is set to the total number of forward passes per step. This value of `maxlen` ensures we log only the
-        # final optimization step.
-        maxlen = self.accelerator.num_processes * args.per_device_train_batch_size * args.steps_per_generation
+        # hardcoded to 128 so wandb logs enough completions for analysis
+        maxlen = 128
         self._textual_logs = {
             "prompt": deque(maxlen=maxlen),
             "completion": deque(maxlen=maxlen),
@@ -709,6 +709,11 @@ class GRPOTrainer(Trainer):
                     self.reward_funcs[i] = self.accelerator.prepare_model(
                         reward_func, evaluation_mode=True, device_placement=True
                     )
+
+        # Zero-accuracy query collection
+        self.collect_zero_acc_enabled = getattr(args, "collect_zero_acc_enabled", False)
+        self.collect_zero_acc_output_path = getattr(args, "collect_zero_acc_output_path", "./zero_acc_queries.json")
+        self.zero_acc_queries: list[str] = []  # accumulated across steps
 
     def _set_signature_columns_if_needed(self):
         # If `self.args.remove_unused_columns` is True, non-signature columns are removed.
@@ -1263,6 +1268,24 @@ class GRPOTrainer(Trainer):
         # Gather the reward per function: this part is crucial, because the rewards are normalized per group and the
         # completions may be distributed across processes
         rewards_per_func = gather(rewards_per_func)
+
+        # --- Zero-accuracy query collection ---
+        if self.collect_zero_acc_enabled and mode == "train":
+            # accuracy is always the first reward function
+            acc_rewards = rewards_per_func[:, 0]
+            grouped_acc = acc_rewards.view(-1, self.num_generations)  # [num_prompts, G]
+            zero_acc_mask = (grouped_acc == 0.0).all(dim=1)  # all G completions wrong
+            if zero_acc_mask.any():
+                all_prompts = gather_object(prompts_text)
+                # deduplicate: take every num_generations-th prompt (unique prompts)
+                unique_prompts = [all_prompts[i] for i in range(0, len(all_prompts), self.num_generations)]
+                for i, is_zero in enumerate(zero_acc_mask.tolist()):
+                    if is_zero and i < len(unique_prompts):
+                        self.zero_acc_queries.append(unique_prompts[i])
+                if self.accelerator.is_main_process:
+                    with open(self.collect_zero_acc_output_path, "w") as f:
+                        json.dump(list(dict.fromkeys(self.zero_acc_queries)), f, ensure_ascii=False, indent=2)
+        # --- End zero-acc collection ---
 
         # Apply weights to each reward function's output and sum
         rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).nansum(dim=1)
