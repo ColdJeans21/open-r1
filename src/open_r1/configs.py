@@ -172,6 +172,12 @@ class GRPOConfig(trl.GRPOConfig):
         default="./zero_acc_queries.json",
         metadata={"help": "Path to save zero-accuracy queries JSON file."},
     )
+    # Phase 1: enhanced zero-acc collection with per-step entropy
+    collect_zero_acc_with_entropy: bool = field(
+        default=False,
+        metadata={"help": "If True, also record per-(.\\n\\n / ?\\n\\n)-step entropy for each zero-acc completion."},
+    )
+    # Phase 2: see config_limo_phase2.yaml and grpo_phase2.py
 
 
 @dataclass
@@ -336,4 +342,38 @@ class GRPOScriptArguments(ScriptArguments):
     soft_punish_cache: int = field(
         default=4096,
         metadata={"help": "Minimum number of characters in completion."},
+    )
+
+    # Phase 2: entropy-based hint resample + GRPO
+    phase2_input_json: str = field(
+        default="./zero_acc_with_entropy.json",
+        metadata={"help": "Path to Phase 1 output JSON (input for Phase 2)."},
+    )
+    phase2_output_json: str = field(
+        default="./phase2_metrics.jsonl",
+        metadata={"help": "Path to Phase 2 output JSONL (one line per sample)."},
+    )
+    phase2_alpha: float = field(
+        default=0.8,
+        metadata={"help": "Delta-H threshold for truncation candidate selection."},
+    )
+    phase2_beta: float = field(
+        default=0.2,
+        metadata={"help": "Fraction of qualifying positions for choosing truncation index."},
+    )
+    phase2_insert_hint: bool = field(
+        default=True,
+        metadata={"help": "If True, insert a reflection hint at the truncation point."},
+    )
+    phase2_hint_text: str = field(
+        default="Wait, I need to pause and carefully re-examine my reasoning above. Something might be off — let me go back through each step.\n\n",
+        metadata={"help": "Hint text to insert at truncation point."},
+    )
+    phase2_max_new_tokens: int = field(
+        default=4096,
+        metadata={"help": "Max tokens to generate per resample."},
+    )
+    phase2_skip_samples: int = field(
+        default=0,
+        metadata={"help": "Skip the first N samples in the Phase 2 dataset (for resume)."},
     )

@@ -249,38 +249,50 @@ def get_cosine_scaled_reward(
         contents = [completion[0]["content"] for completion in completions]
         rewards = []
 
-        for content, sol in zip(contents, solution):
-            gold_parsed = parse(
-                sol,
-                extraction_mode="first_match",
-                extraction_config=[LatexExtractionConfig()],
-            )
-            if len(gold_parsed) == 0:
-                rewards.append(1.0)  # Skip unparseable examples
-                print("Failed to parse gold solution: ", sol)
-                continue
+        # For datasets with plain-text answers (e.g. GAIR/LIMO), use direct
+        # \boxed{} extraction instead of LaTeX parsing which fails on bare numbers.
+        direct_answers = kwargs.get("answer", None)
 
-            answer_parsed = parse(
-                content,
-                extraction_config=[
-                    LatexExtractionConfig(
-                        normalization_config=NormalizationConfig(
-                            nits=False,
-                            malformed_operators=False,
-                            basic_latex=True,
-                            equations=True,
-                            boxed=True,
-                            units=True,
-                        ),
-                        boxed_match_priority=0,
-                        try_extract_without_anchor=False,
-                    )
-                ],
-                extraction_mode="first_match",
-            )
-
-            is_correct = verify(answer_parsed, gold_parsed)
+        for i, (content, sol) in enumerate(zip(contents, solution)):
             gen_len = len(content)
+            boxed_match = re.search(r"\\boxed\{([^}]*)\}", content)
+            pred = boxed_match.group(1).strip() if boxed_match else None
+
+            # Determine correctness
+            if direct_answers is not None:
+                gold = str(direct_answers[i]).strip()
+                is_correct = (pred is not None and pred == gold)
+            else:
+                # LaTeX parsing path (for datasets with LaTeX-formatted solutions)
+                gold_parsed = parse(
+                    sol,
+                    extraction_mode="first_match",
+                    extraction_config=[LatexExtractionConfig()],
+                )
+                if len(gold_parsed) > 0:
+                    answer_parsed = parse(
+                        content,
+                        extraction_config=[
+                            LatexExtractionConfig(
+                                normalization_config=NormalizationConfig(
+                                    nits=False,
+                                    malformed_operators=False,
+                                    basic_latex=True,
+                                    equations=True,
+                                    boxed=True,
+                                    units=True,
+                                ),
+                                boxed_match_priority=0,
+                                try_extract_without_anchor=False,
+                            )
+                        ],
+                        extraction_mode="first_match",
+                    )
+                    is_correct = verify(answer_parsed, gold_parsed)
+                else:
+                    # Fallback: compare \boxed{} content directly against solution string
+                    gold_str = str(sol).strip()
+                    is_correct = (pred is not None and pred == gold_str)
 
             # Apply cosine scaling based on length
             progress = gen_len / max_len
@@ -290,7 +302,6 @@ def get_cosine_scaled_reward(
                 min_value = min_value_correct
                 max_value = max_value_correct
             else:
-                # Swap min/max for incorrect answers
                 min_value = max_value_wrong
                 max_value = min_value_wrong
 

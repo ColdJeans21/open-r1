@@ -713,7 +713,125 @@ class GRPOTrainer(Trainer):
         # Zero-accuracy query collection
         self.collect_zero_acc_enabled = getattr(args, "collect_zero_acc_enabled", False)
         self.collect_zero_acc_output_path = getattr(args, "collect_zero_acc_output_path", "./zero_acc_queries.json")
-        self.zero_acc_queries: list[str] = []  # accumulated across steps
+        self.collect_zero_acc_with_entropy = getattr(args, "collect_zero_acc_with_entropy", False)
+        self.zero_acc_data: list[dict] = []  # accumulated across steps (enhanced format)
+        self.zero_acc_queries: list[str] = []  # simple format (backward compat)
+        # On resume, reload existing data so we append instead of overwrite
+        if self.collect_zero_acc_enabled and os.path.exists(self.collect_zero_acc_output_path):
+            try:
+                with open(self.collect_zero_acc_output_path) as f:
+                    existing = json.load(f)
+                if isinstance(existing, list):
+                    self.zero_acc_data = existing
+                elif isinstance(existing, list) and all(isinstance(x, str) for x in existing):
+                    self.zero_acc_queries = existing
+            except Exception:
+                pass
+
+    def _extract_entropy_for_zero_acc(
+        self, prompt_ids, completion_ids, completion_texts, zero_acc_mask, ground_truths, questions=None
+    ):
+        """Extract Shannon entropy at each .\\n\\n / ?\\n\\n position in zero-acc completions.
+
+        Called after rewards are computed, runs a single forward pass per zero-acc completion
+        to get logits, then computes H_t = -Σ p(v) log p(v) at each sentence-break token.
+
+        Returns list of enriched zero-acc entries.
+        """
+        entries = []
+        device = prompt_ids.device
+        num_prompts = zero_acc_mask.size(0)  # number of unique prompts in batch
+        num_generations = self.num_generations
+
+        for p_idx in range(num_prompts):
+            if not zero_acc_mask[p_idx]:
+                continue
+            gt = ground_truths[p_idx] if p_idx < len(ground_truths) else ""
+            prompt_len = (prompt_ids[p_idx] != self.processing_class.pad_token_id).sum().item()
+            entries_for_prompt = []
+
+            for g in range(num_generations):
+                idx = p_idx * num_generations + g
+                comp_ids = completion_ids[idx]
+                comp_mask = (comp_ids != self.processing_class.pad_token_id)
+                comp_len = comp_mask.sum().item()
+                if comp_len == 0:
+                    entries_for_prompt.append(None)
+                    continue
+
+                full_ids = torch.cat([prompt_ids[p_idx, :prompt_len], comp_ids[:comp_len]]).unsqueeze(0).to(device)
+
+                with torch.no_grad():
+                    logits = self.model(full_ids).logits[0].float()  # [seq_len, vocab_size]
+
+                seq_len = logits.size(0)
+                entropy_steps = []
+                step_counter = 0
+
+                for pos in range(prompt_len, seq_len):
+                    if pos == 0:
+                        continue
+                    token_id = full_ids[0, pos].item()
+                    token_text = self.processing_class.decode([token_id], skip_special_tokens=True)
+                    if not (token_text.endswith(".\n\n") or token_text.endswith("?\n\n")):
+                        continue
+
+                    step_counter += 1
+                    # logits at position pos-1 predict the token at position pos
+                    logit = logits[pos - 1]
+                    probs = torch.softmax(logit, dim=-1)
+                    log_probs = torch.log(probs + 1e-12)
+                    entropy = -(probs * log_probs).sum().item()
+
+                    entropy_steps.append({
+                        "step": step_counter,
+                        "entropy": entropy,
+                        "nn_token_text": token_text,
+                        "rel_pos": pos - prompt_len,  # position relative to completion start
+                    })
+
+                entries_for_prompt.append({
+                    "completion_text": completion_texts[idx] if idx < len(completion_texts) else "",
+                    "entropy_steps": entropy_steps,
+                    "total_steps": step_counter,
+                })
+
+            if entries_for_prompt:
+                q_text = questions[p_idx] if questions and p_idx < len(questions) else ""
+                entries.append({
+                    "q": q_text,
+                    "o_i": entries_for_prompt,
+                    "ground_truth": gt,
+                })
+
+        return entries
+
+    def _on_completions_generated(self, inputs, prompts_text, completions_text):
+        """Hook called after completions are generated and scored, before gather.
+
+        Subclasses can override this to collect per-sample metrics without
+        relying on the deque-backed _textual_logs (which has maxlen=128 and
+        silently drops old entries).
+        """
+        pass
+
+    def _prepend_phase2_suffix(self, inputs, prompt_ids, completion_ids, completion_mask):
+        """Hook called after generation, before the forward pass for logprobs.
+
+        Phase2Trainer overrides this to prepend the truncated suffix + hint
+        tokens to each completion so they participate in the GRPO loss.
+        Returns (prompt_ids, completion_ids, completion_mask).
+        """
+        return prompt_ids, completion_ids, completion_mask
+
+    def _get_display_texts(self, inputs, prompts_text, completions_text):
+        """Hook to override prompt/completion for wandb logging.
+
+        Phase2Trainer overrides this so wandb shows clean_prompt as prompt
+        and (truncated_suffix + generated) as completion.
+        Returns (display_prompts, display_completions).
+        """
+        return prompts_text, completions_text
 
     def _set_signature_columns_if_needed(self):
         # If `self.args.remove_unused_columns` is True, non-signature columns are removed.
@@ -1187,6 +1305,12 @@ class GRPOTrainer(Trainer):
             [id.item() for id, m in zip(row, mask_row) if m] for row, mask_row in zip(completion_ids, completion_mask)
         ]
 
+        # Phase 2 hook: prepend truncated suffix tokens so they participate in loss
+        prompt_ids, completion_ids, completion_mask = self._prepend_phase2_suffix(
+            inputs, prompt_ids, completion_ids, completion_mask
+        )
+        prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+
         # Sum along sequence dimension (dim=1) to get completion length per sequence, used for logging
         completion_lengths = completion_mask.sum(1)
 
@@ -1221,7 +1345,7 @@ class GRPOTrainer(Trainer):
                 bootstrap = prompt.pop()["content"] if prompt[-1]["role"] == "assistant" else ""
                 completions.append([{"role": "assistant", "content": bootstrap + completion}])
         else:
-            completions = completions_text
+            completions = [[{"role": "assistant", "content": text}] for text in completions_text]
 
         rewards_per_func = torch.zeros(len(prompts), len(self.reward_funcs), device=device)
 
@@ -1238,7 +1362,7 @@ class GRPOTrainer(Trainer):
                         messages = [{"messages": p + c} for p, c in zip(prompts, completions)]
                         texts = [apply_chat_template(x, reward_processing_class)["text"] for x in messages]
                     else:
-                        texts = [p + c for p, c in zip(prompts, completions)]
+                        texts = [p + c for p, c in zip(prompts, completions_text)]
                     reward_inputs = reward_processing_class(
                         text=texts, return_tensors="pt", padding=True, padding_side="right", add_special_tokens=False
                     )
@@ -1265,22 +1389,44 @@ class GRPOTrainer(Trainer):
                 "Please ensure that at least one reward function returns a valid reward."
             )
 
+        # --- Zero-accuracy / all-wrong query collection (entropy extraction before gather) ---
+        if self.collect_zero_acc_enabled and mode == "train":
+            local_rew = rewards_per_func[:, 0]
+            local_grouped = local_rew.view(-1, self.num_generations)
+            # General "all completions wrong": accuracy=0 or cosine<0 → reward <= 0
+            local_all_wrong_mask = (torch.nan_to_num(local_grouped, nan=-1.0) <= 0.0).all(dim=1)
+
+            # Extract entropy locally BEFORE gather (needs local tensors)
+            if self.collect_zero_acc_with_entropy and local_all_wrong_mask.any():
+                local_gt_list = reward_kwargs.get("answer", [""] * len(prompts_text))
+                local_q_list = reward_kwargs.get("question", None)
+                local_entries = self._extract_entropy_for_zero_acc(
+                    prompt_ids, completion_ids, completions_text,
+                    local_all_wrong_mask, local_gt_list, local_q_list
+                )
+                # Gather across processes
+                all_local_entries = gather_object(local_entries)
+                if self.accelerator.is_main_process:
+                    for entry in all_local_entries:
+                        if entry:
+                            self.zero_acc_data.append(entry)
+                    with open(self.collect_zero_acc_output_path, "w") as f:
+                        json.dump(self.zero_acc_data, f, ensure_ascii=False, indent=2)
+
         # Gather the reward per function: this part is crucial, because the rewards are normalized per group and the
         # completions may be distributed across processes
         rewards_per_func = gather(rewards_per_func)
 
-        # --- Zero-accuracy query collection ---
-        if self.collect_zero_acc_enabled and mode == "train":
-            # accuracy is always the first reward function
-            acc_rewards = rewards_per_func[:, 0]
-            grouped_acc = acc_rewards.view(-1, self.num_generations)  # [num_prompts, G]
-            zero_acc_mask = (grouped_acc == 0.0).all(dim=1)  # all G completions wrong
-            if zero_acc_mask.any():
+        # --- Zero-accuracy query collection (simple format, after gather) ---
+        if self.collect_zero_acc_enabled and mode == "train" and not self.collect_zero_acc_with_entropy:
+            rew_first = rewards_per_func[:, 0]
+            grouped_rew = rew_first.view(-1, self.num_generations)
+            all_wrong_mask = (torch.nan_to_num(grouped_rew, nan=-1.0) <= 0.0).all(dim=1)
+            if all_wrong_mask.any():
                 all_prompts = gather_object(prompts_text)
-                # deduplicate: take every num_generations-th prompt (unique prompts)
                 unique_prompts = [all_prompts[i] for i in range(0, len(all_prompts), self.num_generations)]
-                for i, is_zero in enumerate(zero_acc_mask.tolist()):
-                    if is_zero and i < len(unique_prompts):
+                for i, is_wrong in enumerate(all_wrong_mask.tolist()):
+                    if is_wrong and i < len(unique_prompts):
                         self.zero_acc_queries.append(unique_prompts[i])
                 if self.accelerator.is_main_process:
                     with open(self.collect_zero_acc_output_path, "w") as f:
@@ -1342,12 +1488,18 @@ class GRPOTrainer(Trainer):
         self._metrics[mode]["reward_std"].append(std_grouped_rewards.mean().item())
         self._metrics[mode]["frac_reward_zero_std"].append(is_std_zero.float().mean().item())
 
+        # Let subclasses override prompt/completion for display (e.g. Phase 2)
+        display_prompts, display_completions = self._get_display_texts(inputs, prompts_text, completions_text)
+
         # Log prompt and completion texts
-        self._textual_logs["prompt"].extend(gather_object(prompts_text))
-        self._textual_logs["completion"].extend(gather_object(completions_text))
+        self._textual_logs["prompt"].extend(gather_object(display_prompts))
+        self._textual_logs["completion"].extend(gather_object(display_completions))
         for i, name in enumerate(self.reward_func_names):
             self._textual_logs["rewards"][name].extend(rewards_per_func[:, i].tolist())
         self._textual_logs["advantages"].extend(all_process_advantages.tolist())
+
+        # Hook for subclasses to collect per-sample metrics after generation
+        self._on_completions_generated(inputs, prompts_text, completions_text)
 
         return {
             "prompt_ids": prompt_ids,
@@ -1552,7 +1704,10 @@ class GRPOTrainer(Trainer):
                 df = pd.DataFrame(table)
                 if self.wandb_log_unique_prompts:
                     df = df.drop_duplicates(subset=["prompt"])
-                wandb.log({"completions": wandb.Table(dataframe=df)})
+                # Log completion table only once to avoid disk bloat (deque already capped at 128)
+                if not getattr(self, "_wandb_completions_logged", False):
+                    wandb.log({"completions": wandb.Table(dataframe=df)})
+                    self._wandb_completions_logged = True
 
     def create_model_card(
         self,

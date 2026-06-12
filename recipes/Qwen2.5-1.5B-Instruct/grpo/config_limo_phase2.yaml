@@ -1,0 +1,79 @@
+# Phase 2: Entropy-based hint resample + GRPO training
+# Data: Phase 1 zero_acc_with_entropy.json
+# Uses vLLM for generation, same GRPO trainer as Phase 1
+
+# Model — should point to Phase 1 trained checkpoint
+model_name_or_path: /gpt/work/Ryan/xz/Qwen3-4B/phase1_zero_acc_with_entropy_idea6/checkpoint-817
+model_revision: main
+torch_dtype: bfloat16
+attn_implementation: flash_attention_2
+
+# Phase 2 specific (dataset_name is placeholder — actual data loaded from phase2_input_json)
+dataset_name: phase2_json
+phase2_input_json: /gpt/work/Ryan/xz/Qwen3-4B/phase1_zero_acc_with_entropy_idea6/zero_acc_with_entropy.json
+phase2_output_json: /gpt/work/Ryan/xz/Qwen3-4B/idea6_beta/beta1.0alpha1.5/phase2_metrics.jsonl
+phase2_alpha: 1.5
+phase2_beta: 1.0
+phase2_insert_hint: True
+phase2_hint_text: "Wait, I need to pause and carefully re-examine my reasoning above. Something might be off — let me go back through each step.\n\n"
+# phase2_max_new_tokens: 7120
+phase2_skip_samples: 0  # resume 时设为已处理的样本数，跳过前 N 条数据
+
+# System Prompt
+system_prompt: 'A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant first thinks about the reasoning process in the mind and then provides the user with the answer, and put your final answer within \boxed{} . The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think> <answer> answer here </answer>.'
+
+# GRPO trainer config
+bf16: true
+use_vllm: true
+vllm_mode: colocate
+vllm_gpu_memory_utilization: 0.28
+vllm_max_model_len: 11275
+beta: 0.01
+temperature: 0.8
+
+do_eval: false
+gradient_accumulation_steps: 8
+gradient_checkpointing: true
+use_liger_loss: true
+gradient_checkpointing_kwargs:
+  use_reentrant: false
+learning_rate: 2.0e-06
+log_completions: true
+log_level: info
+logging_first_step: true
+logging_steps: 1
+logging_strategy: steps
+lr_scheduler_type: cosine
+max_prompt_length: 512
+max_completion_length: 6120
+max_steps: 400
+num_train_epochs: -1
+num_generations: 8
+output_dir: /gpt/work/Ryan/xz/Qwen3-4B/idea6_beta/beta1.0alpha1.5
+overwrite_output_dir: false
+per_device_eval_batch_size: 1
+per_device_train_batch_size: 1
+push_to_hub: false
+
+reward_funcs:
+- cosine
+- tag_count
+reward_weights:
+- 1.0
+- 1.0
+
+cosine_min_value_wrong: 0.0
+cosine_max_value_wrong: -0.5
+cosine_min_value_correct: 0.5
+cosine_max_value_correct: 1.0
+cosine_max_len: 40000  # truncated_suffix + hint + new_gen 的总 token 上限
+
+save_strategy: "steps"
+save_steps: 400
+wandb_log_unique_prompts: false
+save_total_limit: 1
+seed: 50
+shuffle_dataset: false
+warmup_ratio: 0.1
+
+use_peft: false
