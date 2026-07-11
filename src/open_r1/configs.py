@@ -377,3 +377,7 @@ class GRPOScriptArguments(ScriptArguments):
         default=0,
         metadata={"help": "Skip the first N samples in the Phase 2 dataset (for resume)."},
     )
+    phase2_use_absolute_h: bool = field(
+        default=False,
+        metadata={"help": "If True, use absolute entropy H instead of ΔH for truncation (ablation: w/o ΔH trigger)."},
+    )

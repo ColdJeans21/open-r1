@@ -104,6 +104,19 @@ def apply_alpha_filter(deltas: list[float], alpha: float) -> list[int]:
     return qualifying
 
 
+def apply_alpha_filter_absolute(steps: list[dict], alpha: float) -> list[int]:
+    """Ablation: Return indices into steps array where absolute entropy H > alpha.
+
+    Unlike the standard ΔH filter (which uses H_t - H_{t-1}), this directly
+    thresholds on the absolute entropy value at each sentence break.
+    """
+    qualifying = []
+    for i, step in enumerate(steps):
+        if step["entropy"] > alpha:
+            qualifying.append(i)
+    return qualifying
+
+
 def choose_truncation_step(qualifying_indices: list[int], beta: float) -> Optional[dict]:
     """Choose the truncation step using beta.
 

@@ -23,7 +23,7 @@ from open_r1.utils import get_model, get_tokenizer
 from open_r1.utils.callbacks import get_callbacks
 from open_r1.utils.wandb_logging import init_wandb_training
 from trl import GRPOTrainer, ModelConfig, TrlParser, get_peft_config
-from open_r1.hint_resample import compute_deltas, apply_alpha_filter, choose_truncation_step
+from open_r1.hint_resample import compute_deltas, apply_alpha_filter, apply_alpha_filter_absolute, choose_truncation_step
 
 logger = logging.getLogger(__name__)
 
@@ -31,13 +31,18 @@ logger = logging.getLogger(__name__)
 def _build_phase2_prefix(
     tokenizer, system_prompt, question, completion_text,
     entropy_steps, alpha, beta, insert_hint, hint_text,
+    use_absolute_h=False,
 ):
+    """Build Phase 2 prompt prefix with entropy-based truncation.
+
+    Args:
+        use_absolute_h: If True, use absolute entropy H > alpha instead of
+                       ΔH = H_t - H_{t-1} > alpha to find truncation points.
+                       This is the "w/o ΔH trigger" ablation.
+    """
     steps = entropy_steps
     if len(steps) < 2:
         return None
-
-    deltas = compute_deltas(steps)
-    qualifying = apply_alpha_filter(deltas, alpha)
 
     metrics = {
         "chosen_truncation_index": None,
@@ -51,15 +56,28 @@ def _build_phase2_prefix(
     clean_prompt = tokenizer.apply_chat_template(msgs, add_generation_prompt=True, tokenize=False)
     metrics["clean_prompt"] = clean_prompt
 
+    if use_absolute_h:
+        # Ablation: use absolute entropy H instead of ΔH
+        qualifying = apply_alpha_filter_absolute(steps, alpha)
+    else:
+        # Standard DERPO: use ΔH = H_t - H_{t-1}
+        deltas = compute_deltas(steps)
+        qualifying = apply_alpha_filter(deltas, alpha)
+
     if not qualifying:
         metrics["prefix_text"] = clean_prompt
     else:
         chosen_step_idx = choose_truncation_step(qualifying, beta)
         chosen_step = steps[chosen_step_idx]
-        chosen_delta = deltas[chosen_step_idx - 1]
+
         metrics["chosen_truncation_index"] = chosen_step["step"]
-        metrics["spike_delta_H"] = chosen_delta
         metrics["spike_absolute_H"] = chosen_step["entropy"]
+
+        if not use_absolute_h:
+            # ΔH only defined when using deltas
+            deltas = compute_deltas(steps)
+            chosen_delta = deltas[chosen_step_idx - 1]
+            metrics["spike_delta_H"] = chosen_delta
 
         rel_pos = chosen_step.get("rel_pos", 0)
         comp_ids = tokenizer(completion_text, return_tensors="pt").input_ids[0]
@@ -83,7 +101,7 @@ def _build_phase2_prefix(
     return metrics
 
 
-def build_phase2_dataset(input_json, tokenizer, system_prompt, alpha, beta, insert_hint, hint_text, skip_samples=0):
+def build_phase2_dataset(input_json, tokenizer, system_prompt, alpha, beta, insert_hint, hint_text, skip_samples=0, use_absolute_h=False):
     with open(input_json) as f:
         phase1_data = json.load(f)
     if isinstance(phase1_data, dict):
@@ -113,6 +131,7 @@ def build_phase2_dataset(input_json, tokenizer, system_prompt, alpha, beta, inse
             info = _build_phase2_prefix(
                 tokenizer, system_prompt, q_text, comp_text, entropy_steps,
                 alpha, beta, insert_hint, hint_text,
+                use_absolute_h=use_absolute_h,
             )
             if info is None:
                 skipped_prefix_failed += 1
@@ -389,6 +408,12 @@ def main(script_args, training_args, model_args):
     tokenizer = get_tokenizer(model_args, training_args)
     model = get_model(model_args, training_args)
 
+    use_absolute_h = getattr(script_args, 'phase2_use_absolute_h', False)
+    if use_absolute_h:
+        logger.info("Ablation: using absolute entropy H (w/o ΔH trigger)")
+    if not script_args.phase2_insert_hint:
+        logger.info("Ablation: resampling without hint (w/o hint v)")
+
     logger.info(f"Building Phase 2 dataset from {script_args.phase2_input_json}")
     dataset = build_phase2_dataset(
         input_json=script_args.phase2_input_json,
@@ -399,6 +424,7 @@ def main(script_args, training_args, model_args):
         insert_hint=script_args.phase2_insert_hint,
         hint_text=script_args.phase2_hint_text,
         skip_samples=script_args.phase2_skip_samples,
+        use_absolute_h=use_absolute_h,
     )
 
     reward_funcs = get_reward_funcs(script_args)
