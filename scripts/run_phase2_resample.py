@@ -1,12 +1,12 @@
 #!/usr/bin/env python
 """
-Phase 2: Delta-entropy based hint resampling experiment.
+Phase 2: Absolute-entropy based hint resampling experiment.
 
 Reads Phase 1 JSON (zero-acc queries with completions), loads the model,
 and for each (q, o_i) pair:
   1. Computes Shannon entropy at every token position
   2. Identifies .\n\n / ?\n\n step positions
-  3. Computes delta-H and applies alpha/beta filters
+  3. Applies alpha/beta filters to absolute entropy
   4. Truncates, optionally inserts hint, resamples
   5. Records success/failure and all metrics
 
@@ -37,7 +37,7 @@ from open_r1.hint_resample import (
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Phase 2: Delta-entropy hint resample")
+    parser = argparse.ArgumentParser(description="Phase 2: absolute-entropy hint resample")
     parser.add_argument("--model_path", type=str, required=True)
     parser.add_argument("--input_json", type=str, required=True)
     parser.add_argument("--output_json", type=str, required=True)

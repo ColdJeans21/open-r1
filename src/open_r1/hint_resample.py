@@ -3,8 +3,8 @@ hint_resample.py — Phase 2 engine for entropy-based hint resampling.
 
 Flow for each (q, o_i):
   1. Feed completion through model token-by-token, compute Shannon entropy at each token.
-  2. Identify .\n\n / ?\n\n tokens, compute ΔH_t = H_t - H_{t-1}.
-  3. Retain positions where ΔH_t > alpha → list L.
+  2. Identify .\n\n / ?\n\n tokens and their absolute entropy H_t.
+  3. Retain positions where H_t > alpha → list L.
   4. Truncate at index floor(beta * len(L)) in L.
   5. Optionally insert hint, resample with model.
   6. Extract boxed answer, compare to ground truth, output metrics.
@@ -94,13 +94,12 @@ def compute_deltas(steps: list[dict]) -> list[float]:
     return [steps[i]["entropy"] - steps[i - 1]["entropy"] for i in range(1, len(steps))]
 
 
-def apply_alpha_filter(deltas: list[float], alpha: float) -> list[int]:
-    """Return indices (into original steps array, offset by +1 since deltas[0]→steps[1])
-    where ΔH > alpha."""
+def apply_alpha_filter(steps: list[dict], alpha: float) -> list[int]:
+    """Return indices into the original steps array where absolute entropy H > alpha."""
     qualifying = []
-    for i, d in enumerate(deltas):
-        if d > alpha:
-            qualifying.append(i + 1)  # index into steps array
+    for i, step in enumerate(steps):
+        if step["entropy"] > alpha:
+            qualifying.append(i)
     return qualifying
 
 
@@ -168,11 +167,11 @@ def run_single_resample(
     """
     device = next(model.parameters()).device
 
-    # 1. Compute deltas
+    # 1. Compute deltas for metrics; truncation candidates use absolute entropy.
     deltas = compute_deltas(steps)
 
     # 2. Alpha filter
-    qualifying = apply_alpha_filter(deltas, alpha)
+    qualifying = apply_alpha_filter(steps, alpha)
 
     if not qualifying:
         # No positions qualify — return failure
@@ -189,7 +188,7 @@ def run_single_resample(
     # 3. Beta selection
     chosen_step_idx = choose_truncation_step(qualifying, beta)
     chosen_step = steps[chosen_step_idx]
-    chosen_delta = deltas[chosen_step_idx - 1]  # deltas[i] corresponds to steps[i+1]
+    chosen_delta = deltas[chosen_step_idx - 1] if chosen_step_idx > 0 else None
 
     # 4. Locate truncation position using pre-computed rel_pos (completion-relative)
     rel_pos = chosen_step["rel_pos"]

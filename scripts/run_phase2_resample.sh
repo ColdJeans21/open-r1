@@ -1,5 +1,5 @@
 #!/bin/bash
-# Phase 2: Delta-entropy hint resampling experiment
+# Phase 2: Absolute-entropy hint resampling experiment
 # Usage: bash scripts/run_phase2_resample.sh
 
 # ===================== tunable parameters =====================
@@ -7,7 +7,7 @@ MODEL_PATH="/gpt/work/Ryan/xz/Qwen3-4B"
 INPUT_JSON="/gpt/work/Ryan/xz/Qwen3-4B/phase1_zero_acc_with_entropy/zero_acc_with_entropy.json"
 OUTPUT_JSON="/gpt/work/Ryan/xz/Qwen3-4B/phase2_resample_metrics.jsonl"
 
-ALPHA=1.5          # delta-H threshold (0 ~ 11.9)
+ALPHA=1.5          # absolute entropy threshold (0 ~ 11.9)
 BETA=0.5           # fraction of qualifying positions
 INSERT_HINT=true   # insert reflection hint?
 HINT_TEXT="Wait, I need to pause and carefully re-examine my reasoning above. Something might be off — let me go back through each step.\n\n"
@@ -18,7 +18,7 @@ TOP_P=0.95
 export CUDA_VISIBLE_DEVICES=1
 # ==============================================================
 
-echo "Phase 2: Delta-entropy hint resampling"
+echo "Phase 2: absolute-entropy hint resampling"
 echo "  Model:      ${MODEL_PATH}"
 echo "  Input:      ${INPUT_JSON}"
 echo "  Output:     ${OUTPUT_JSON}"

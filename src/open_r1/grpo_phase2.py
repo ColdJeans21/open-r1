@@ -37,7 +37,7 @@ def _build_phase2_prefix(
         return None
 
     deltas = compute_deltas(steps)
-    qualifying = apply_alpha_filter(deltas, alpha)
+    qualifying = apply_alpha_filter(steps, alpha)
 
     metrics = {
         "chosen_truncation_index": None,
@@ -56,7 +56,7 @@ def _build_phase2_prefix(
     else:
         chosen_step_idx = choose_truncation_step(qualifying, beta)
         chosen_step = steps[chosen_step_idx]
-        chosen_delta = deltas[chosen_step_idx - 1]
+        chosen_delta = deltas[chosen_step_idx - 1] if chosen_step_idx > 0 else None
         metrics["chosen_truncation_index"] = chosen_step["step"]
         metrics["spike_delta_H"] = chosen_delta
         metrics["spike_absolute_H"] = chosen_step["entropy"]

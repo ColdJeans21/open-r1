@@ -355,7 +355,7 @@ class GRPOScriptArguments(ScriptArguments):
     )
     phase2_alpha: float = field(
         default=0.8,
-        metadata={"help": "Delta-H threshold for truncation candidate selection."},
+        metadata={"help": "Absolute entropy threshold for truncation candidate selection."},
     )
     phase2_beta: float = field(
         default=0.2,
